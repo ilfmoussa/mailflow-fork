@@ -298,6 +298,8 @@ export default function Sidebar() {
     sidebarWidth,
     isSidebarResizing,
     showContacts, setShowContacts,
+    selectedTag, setSelectedTag,
+    availableTags, fetchTags,
   } = useStore();
 
   const isMobile = useMobile();
@@ -308,6 +310,12 @@ export default function Sidebar() {
   useEffect(() => {
     if (isMobile) setMobileSidebarOpen(false);
   }, [selectedAccountId, selectedFolder]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [tagsExpanded, setTagsExpanded] = useState(true);
+
+  useEffect(() => {
+    if (accountsReady) fetchTags(selectedAccountId || undefined);
+  }, [accountsReady, selectedAccountId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const [msgDragTarget, setMsgDragTarget] = useState(null);
 
@@ -1117,6 +1125,66 @@ export default function Sidebar() {
             </>
           );
         })()}
+
+        {/* Tags section */}
+        {!sidebarCollapsed && availableTags.length > 0 && (
+          <>
+            <div
+              onClick={() => setTagsExpanded(prev => !prev)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em',
+                color: 'var(--text-tertiary)', padding: '8px 10px 3px', cursor: 'pointer',
+                userSelect: 'none',
+              }}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ flexShrink: 0 }}>
+                <path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/>
+                <line x1="7" y1="7" x2="7.01" y2="7"/>
+              </svg>
+              <span style={{ flex: 1 }}>{t('sidebar.tags', 'Tags')}</span>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ flexShrink: 0 }}>
+                {tagsExpanded
+                  ? <polyline points="18 15 12 9 6 15" />
+                  : <polyline points="6 9 12 15 18 9" />}
+              </svg>
+            </div>
+            {tagsExpanded && availableTags.map(tag => {
+              const isActive = selectedTag === tag;
+              return (
+                <div
+                  key={tag}
+                  onClick={() => setSelectedTag(isActive ? null : tag)}
+                  onKeyDown={activateOnKey(() => setSelectedTag(isActive ? null : tag))}
+                  role="button"
+                  tabIndex={0}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '6px 10px 6px 18px', borderRadius: 7, cursor: 'pointer',
+                    background: isActive ? 'var(--bg-hover)' : 'transparent',
+                    color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                    transition: 'background 0.1s, color 0.1s',
+                    fontSize: 13, fontWeight: isActive ? 500 : 400,
+                  }}
+                  onMouseEnter={e => {
+                    if (!isActive) { e.currentTarget.style.background = 'var(--bg-tertiary)'; e.currentTarget.style.color = 'var(--text-primary)'; }
+                  }}
+                  onMouseLeave={e => {
+                    if (!isActive) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-secondary)'; }
+                  }}
+                >
+                  <span style={{
+                    width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+                    background: isActive ? 'var(--accent)' : 'var(--text-tertiary)',
+                    opacity: isActive ? 1 : 0.5,
+                  }} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{tag}</span>
+                </div>
+              );
+            })}
+            <div style={{ height: 1, background: 'var(--border-subtle)', margin: '4px 4px 4px' }} />
+          </>
+        )}
 
         {/* Per-account */}
         {accounts.map(account => {

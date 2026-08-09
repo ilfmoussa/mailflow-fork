@@ -119,6 +119,7 @@ export default function MessageList() {
     markReadBehavior, markReadDelay,
     searchAllFolders,
     activeGtdTab, setActiveGtdTab, gtdSections,
+    selectedTag,
   } = useStore();
   // RFC message_id of the open message, so a row highlights when it is a different DB copy
   // of the selected message (multi-folder model) — e.g. the inbox copy of a GTD sidebar click.
@@ -330,6 +331,7 @@ export default function MessageList() {
         if (unreadOnly) params.unreadOnly = 'true';
         if (threadedView) params.threaded = 'true';
         if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
+        if (selectedTag) params.tag = selectedTag;
         await refreshRequestRef.current.run(
           () => api.getMessages(params),
           (data) => {
@@ -360,7 +362,7 @@ export default function MessageList() {
     };
     run();
     return () => { cancelled = true; };
-  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, scrollMode, accountsReady, accounts.length, messagesRefreshToken, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, applyReadGuard, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
+  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, scrollMode, accountsReady, accounts.length, messagesRefreshToken, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, selectedTag, applyReadGuard, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
 
   // Load next page (called by scroll or button)
   const loadMore = useCallback(async () => {
@@ -377,6 +379,8 @@ export default function MessageList() {
       if (unreadOnly) params.unreadOnly = 'true';
       if (useStore.getState().threadedView) params.threaded = 'true';
       if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
+      const curTag = useStore.getState().selectedTag;
+      if (curTag) params.tag = curTag;
       const data = await api.getMessages(params);
       appendMessages(applyReadGuard(data.messages));
       setMessagesOffset(currentOffset + data.messages.length);
@@ -409,6 +413,7 @@ export default function MessageList() {
         if (unreadOnly) params.unreadOnly = 'true';
         if (state.threadedView) params.threaded = 'true';
         if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
+        if (state.selectedTag) params.tag = state.selectedTag;
         await refreshRequestRef.current.run(
           () => api.getMessages(params),
           (data) => {
@@ -566,6 +571,7 @@ export default function MessageList() {
       if (unreadOnly) params.unreadOnly = 'true';
       if (threadedView) params.threaded = 'true';
       if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
+      if (selectedTag) params.tag = selectedTag;
       await refreshRequestRef.current.run(
         () => api.getMessages(params),
         (data) => {
@@ -582,7 +588,7 @@ export default function MessageList() {
     } finally {
       setLoadingMessages(false);
     }
-  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, loadingMessages, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, applyReadGuard, setExpandedThreadId, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
+  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, loadingMessages, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, selectedTag, applyReadGuard, setExpandedThreadId, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
 
   const handleSync = async () => {
     if (syncing) return;
@@ -3380,7 +3386,7 @@ export default function MessageList() {
                 selectedMessageId={selectedMessageId}
                 selectedMid={selectedMid}
                 lastViewedMessageId={lastViewedMessageId}
-                showAccount={false} /* No per-account dot on unified rows: it added noise beside the unread indicator; the account is visible in the message pane header. */
+                showAccount={isUnified}
                 isNarrow={isNarrow}
                 onThreadClick={() => handleThreadClick(message)}
                 showMobileAvatars={showMobileAvatars}
@@ -3421,7 +3427,7 @@ export default function MessageList() {
                 lastViewed={lastViewedMessageId === message.id && selectedMessageId !== message.id}
                 isChecked={selectedIds.has(message.id)}
                 selectionMode={selectionMode}
-                showAccount={false} /* No per-account dot on unified rows: it added noise beside the unread indicator; the account is visible in the message pane header. */
+                showAccount={isUnified}
                 isNarrow={isNarrow}
                 onSelect={handleSelect}
                 onToggleSelect={handleRowToggleSelect}
@@ -3887,7 +3893,10 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
   const isLastViewed = selectedHere
     || lastViewedMessageId === message.id
     || (lastViewedMessageId && threadMsgs?.some(m => m.id === lastViewedMessageId));
-  const bgDefault = isMobile ? 'var(--bg-primary)' : 'transparent';
+  const tintColor = showAccount && message.account_color ? message.account_color : 'var(--accent)';
+  const bgRead = isMobile ? 'var(--bg-primary)' : 'transparent';
+  const bgUnread = `color-mix(in srgb, ${tintColor} 14%, var(--bg-primary))`;
+  const bgDefault = unreadCount > 0 ? bgUnread : bgRead;
   const rowBg = isChecked
     ? 'var(--accent-dim)'
     : (isExpanded ? 'var(--bg-secondary)' : (hovered ? 'var(--bg-tertiary)' : (isLastViewed ? 'var(--accent-glow)' : bgDefault)));
@@ -3920,36 +3929,28 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
           willChange: isMobile ? 'transform' : undefined,
         }}
       >
-        {/* Left indicator: checkbox in selection mode (narrow/mobile), unread dot otherwise */}
-        {!hasAvatar ? (
-          selectionMode ? (
-            <div style={{
-              position: 'absolute', left: 4, top: '50%', transform: 'translateY(-50%)',
-              display: 'flex', alignItems: 'center',
-            }}>
-              <input
-                type="checkbox"
-                checked={isChecked}
-                onChange={() => {}}
-                onClick={e => { e.stopPropagation(); onToggleSelect(message.id); }}
-                style={{ cursor: 'pointer', width: 14, height: 14, accentColor: 'var(--accent)' }}
-              />
-            </div>
-          ) : (
-            unreadCount > 0 && (
-              <div className="unread-dot" style={{
-                position: 'absolute', left: 3, top: '50%', transform: 'translateY(-50%)',
-                width: 7, height: 7, borderRadius: '50%', background: 'var(--accent)',
-              }} />
-            )
-          )
-        ) : (
-          !selectionMode && unreadCount > 0 && (
-            <div className="unread-dot" style={{
-              position: 'absolute', left: 3, top: '50%', transform: 'translateY(-50%)',
-              width: 7, height: 7, borderRadius: '50%', background: 'var(--accent)',
-            }} />
-          )
+        {showAccount && message.account_color && (
+          <div style={{
+            position: 'absolute', left: 0, top: 0, bottom: 0, width: 3,
+            background: message.account_color,
+            borderRadius: '0 2px 2px 0',
+            pointerEvents: 'none',
+          }} />
+        )}
+        {/* Left indicator: checkbox in selection mode */}
+        {selectionMode && (
+          <div style={{
+            position: 'absolute', left: 4, top: '50%', transform: 'translateY(-50%)',
+            display: 'flex', alignItems: 'center',
+          }}>
+            <input
+              type="checkbox"
+              checked={isChecked}
+              onChange={() => {}}
+              onClick={e => { e.stopPropagation(); onToggleSelect(message.id); }}
+              style={{ cursor: 'pointer', width: 14, height: 14, accentColor: 'var(--accent)' }}
+            />
+          </div>
         )}
 
         {/* Avatar — morphs into a checkbox when in selection mode (desktop); display-only on mobile */}
@@ -4012,9 +4013,6 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
           {/* Row 1: sender + badge + date */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 3 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
-              {showAccount && (
-                <div style={{ width: 6, height: 6, borderRadius: '50%', flexShrink: 0, background: message.account_color || '#6366f1' }} />
-              )}
               <span style={{
                 fontSize: 13, fontWeight: unreadCount > 0 ? 600 : 400,
                 color: unreadCount > 0 ? 'var(--text-primary)' : 'var(--text-secondary)',
@@ -4056,20 +4054,42 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
                   </svg>
                 </button>
               )}
-              <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{formatDate(message.date)}</span>
+              <span style={{ fontSize: 11, color: unreadCount > 0 ? 'var(--text-secondary)' : 'var(--text-tertiary)', fontWeight: unreadCount > 0 ? 600 : 400 }}>{formatDate(message.date)}</span>
             </div>
           </div>
           {/* Row 2: subject */}
           <div style={{
-            fontSize: 12, fontWeight: unreadCount > 0 ? 500 : 400,
+            fontSize: 12, fontWeight: unreadCount > 0 ? 600 : 400,
             color: unreadCount > 0 ? 'var(--text-primary)' : 'var(--text-secondary)',
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 2,
           }}>
             {message.subject || t('common.noSubject')}
           </div>
+          {/* Tag badges */}
+          {(() => {
+            const tags = (message.flags || []).filter(f => !f.startsWith('\\') && !f.startsWith('$') && !/^(Junk|JunkRecorded|NonJunk|NotJunk|MDNSent|Forwarded)$/i.test(f));
+            if (!tags.length) return null;
+            return (
+              <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '2px', marginBottom: '2px' }}>
+                {tags.map(tag => (
+                  <span key={tag} style={{
+                    fontSize: '10px',
+                    padding: '1px 6px',
+                    borderRadius: '3px',
+                    backgroundColor: 'var(--tag-bg, rgba(99, 102, 241, 0.15))',
+                    color: 'var(--tag-color, rgb(99, 102, 241))',
+                    fontWeight: 500,
+                    lineHeight: '16px',
+                    whiteSpace: 'nowrap',
+                  }}>{tag}</span>
+                ))}
+              </div>
+            );
+          })()}
           {/* Row 3: snippet */}
           <div style={{
-            fontSize: 12, color: 'var(--text-tertiary)',
+            fontSize: 12, color: unreadCount > 0 ? 'var(--text-secondary)' : 'var(--text-tertiary)',
+            fontWeight: unreadCount > 0 ? 500 : 400,
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           }}>
             {message.snippet || ''}
@@ -4111,19 +4131,15 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
                 display: 'flex', alignItems: 'flex-start', gap: 8,
                 padding: '9px 14px 9px 44px',
                 cursor: 'pointer', position: 'relative',
-                background: selectedMessageId === msg.id || lastViewedMessageId === msg.id ? 'var(--accent-glow)' : 'transparent',
+                background: selectedMessageId === msg.id || lastViewedMessageId === msg.id
+                  ? 'var(--accent-glow)'
+                  : (!msg.is_read ? 'color-mix(in srgb, var(--accent) 12%, var(--bg-primary))' : 'transparent'),
                 borderTop: idx > 0 ? '1px solid var(--border-subtle)' : 'none',
-                transition: 'background 0.1s',
+                transition: 'background 0.15s',
               }}
               onMouseEnter={e => { if (selectedMessageId !== msg.id) e.currentTarget.style.background = 'var(--bg-tertiary)'; }}
-              onMouseLeave={e => { e.currentTarget.style.background = selectedMessageId === msg.id || lastViewedMessageId === msg.id ? 'var(--accent-glow)' : 'transparent'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = selectedMessageId === msg.id || lastViewedMessageId === msg.id ? 'var(--accent-glow)' : (!msg.is_read ? 'color-mix(in srgb, var(--accent) 12%, var(--bg-primary))' : 'transparent'); }}
             >
-              {!msg.is_read && (
-                <div style={{
-                  position: 'absolute', left: 28, top: '50%', transform: 'translateY(-50%)',
-                  width: 6, height: 6, borderRadius: '50%', background: 'var(--accent)',
-                }} />
-              )}
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <span style={{
@@ -4133,12 +4149,13 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
                   }}>
                     {msg.from_name || msg.from_email || t('common.unknown', 'Unknown')}
                   </span>
-                  <span style={{ fontSize: 11, color: 'var(--text-tertiary)', flexShrink: 0, marginLeft: 8 }}>
+                  <span style={{ fontSize: 11, color: msg.is_read ? 'var(--text-tertiary)' : 'var(--text-secondary)', fontWeight: msg.is_read ? 400 : 600, flexShrink: 0, marginLeft: 8 }}>
                     {formatDate(msg.date)}
                   </span>
                 </div>
                 <div style={{
-                  fontSize: 11, color: 'var(--text-tertiary)',
+                  fontSize: 11, color: msg.is_read ? 'var(--text-tertiary)' : 'var(--text-secondary)',
+                  fontWeight: msg.is_read ? 400 : 500,
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1,
                 }}>
                   {msg.snippet || ''}
@@ -4161,9 +4178,10 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
     onTap: isMobile && !selectionMode ? () => onSelect(message) : undefined,
   });
 
-  // On mobile the row content must be opaque — swipe action panels sit behind it
-  // and would show through a transparent background.
-  const bgDefault = isMobile ? 'var(--bg-primary)' : 'transparent';
+  const tintColor = showAccount && message.account_color ? message.account_color : 'var(--accent)';
+  const bgRead = isMobile ? 'var(--bg-primary)' : 'transparent';
+  const bgUnread = `color-mix(in srgb, ${tintColor} 14%, var(--bg-primary))`;
+  const bgDefault = message.is_read ? bgRead : bgUnread;
   const selectedColor = message.account_color || 'var(--accent)';
   const bg = (selected && !selectionMode)
     ? 'var(--accent-glow)'
@@ -4240,47 +4258,28 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
             : undefined,
         }}
       >
-      {/* Selected row left accent rail */}
-      {selected && !selectionMode && (
+      {/* Left accent rail: account color in unified, accent when selected */}
+      {(showAccount && message.account_color) || (selected && !selectionMode) ? (
         <div style={{
           position: 'absolute', left: 0, top: 0, bottom: 0, width: 3,
           background: message.account_color || 'var(--accent)',
           borderRadius: '0 2px 2px 0',
         }} />
-      )}
-      {/* Left indicator: for narrow/mobile layouts show checkbox or unread dot.
-          Wide layouts use the avatar area instead (see below). */}
-      {(!hasInteractiveAvatar) && (
-        selectionMode ? (
-          <div style={{
-            position: 'absolute', left: 4, top: '50%', transform: 'translateY(-50%)',
-            display: 'flex', alignItems: 'center',
-          }}>
-            <input
-              type="checkbox"
-              checked={isChecked}
-              onChange={() => {}}
-              onClick={e => { e.stopPropagation(); onToggleSelect(message.id); }}
-              style={{ cursor: 'pointer', width: 14, height: 14, accentColor: 'var(--accent)' }}
-            />
-          </div>
-        ) : (
-          !message.is_read && (
-            <div className="unread-dot" style={{
-              position: 'absolute', left: 3, top: '50%', transform: 'translateY(-50%)',
-              width: 7, height: 7, borderRadius: '50%',
-              background: 'var(--accent)',
-            }} />
-          )
-        )
-      )}
-      {/* Unread dot for wide layouts — always shown (avatar is separate, doesn't conflict) */}
-      {hasInteractiveAvatar && !selectionMode && !message.is_read && (
+      ) : null}
+      {/* Left indicator: checkbox in selection mode */}
+      {(!hasInteractiveAvatar) && selectionMode && (
         <div style={{
-          position: 'absolute', left: 3, top: '50%', transform: 'translateY(-50%)',
-          width: 7, height: 7, borderRadius: '50%',
-          background: 'var(--accent)',
-        }} />
+          position: 'absolute', left: 4, top: '50%', transform: 'translateY(-50%)',
+          display: 'flex', alignItems: 'center',
+        }}>
+          <input
+            type="checkbox"
+            checked={isChecked}
+            onChange={() => {}}
+            onClick={e => { e.stopPropagation(); onToggleSelect(message.id); }}
+            style={{ cursor: 'pointer', width: 14, height: 14, accentColor: 'var(--accent)' }}
+          />
+        </div>
       )}
 
       <div style={{ paddingLeft: (!hasInteractiveAvatar && selectionMode) ? 22 : 0, display: 'flex', gap: 10, alignItems: 'flex-start' }}>
@@ -4345,12 +4344,6 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
         {/* Row 1: From + date */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 3 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
-            {showAccount && (
-              <div style={{
-                width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
-                background: message.account_color || '#6366f1',
-              }} />
-            )}
             <span style={{
               fontSize: 13, fontWeight: message.is_read ? 400 : 600,
               color: message.is_read ? 'var(--text-secondary)' : 'var(--text-primary)',
@@ -4376,7 +4369,7 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
                 </svg>
               </button>
             )}
-            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+            <span style={{ fontSize: 11, color: message.is_read ? 'var(--text-tertiary)' : 'var(--text-secondary)', fontWeight: message.is_read ? 400 : 600 }}>
               {formatDate(message.date)}
             </span>
           </div>
@@ -4384,7 +4377,7 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
 
         {/* Row 2: Subject */}
         <div style={{
-          fontSize: 13, fontWeight: message.is_read ? 400 : 500,
+          fontSize: 13, fontWeight: message.is_read ? 400 : 600,
           color: message.is_read ? 'var(--text-secondary)' : 'var(--text-primary)',
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           marginBottom: 3,
@@ -4392,10 +4385,34 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
           {message.subject || t('message.noSubject')}
         </div>
 
+        {/* Tag badges */}
+        {(() => {
+          const systemFlags = new Set(['\\Seen', '\\Flagged', '\\Answered', '\\Draft', '\\Deleted', '\\Recent', '\\*']);
+          const tags = (message.flags || []).filter(f => !systemFlags.has(f) && !f.startsWith('$rule_'));
+          if (!tags.length) return null;
+          return (
+            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '2px', marginBottom: '2px' }}>
+              {tags.map(tag => (
+                <span key={tag} style={{
+                  fontSize: '10px',
+                  padding: '1px 6px',
+                  borderRadius: '3px',
+                  backgroundColor: 'var(--tag-bg, rgba(99, 102, 241, 0.15))',
+                  color: 'var(--tag-color, rgb(99, 102, 241))',
+                  fontWeight: 500,
+                  lineHeight: '16px',
+                  whiteSpace: 'nowrap',
+                }}>{tag}</span>
+              ))}
+            </div>
+          );
+        })()}
+
         {/* Row 3: Snippet */}
         <div style={{ display: 'flex', alignItems: 'center' }}>
           <span style={{
-            fontSize: 12, color: 'var(--text-tertiary)',
+            fontSize: 12, color: message.is_read ? 'var(--text-tertiary)' : 'var(--text-secondary)',
+            fontWeight: message.is_read ? 400 : 500,
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             flex: 1,
           }}>

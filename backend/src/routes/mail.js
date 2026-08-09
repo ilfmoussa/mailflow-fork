@@ -106,7 +106,7 @@ function emitGtdSectionsRefresh(rows, userId) {
 
 // Get messages (unified or per-account/folder)
 router.get('/messages', async (req, res) => {
-  const { accountId, folder = 'INBOX', limit = 50, offset = 0, unreadOnly, threaded, category } = req.query;
+  const { accountId, folder = 'INBOX', limit = 50, offset = 0, unreadOnly, threaded, category, tag } = req.query;
 
   if (!isValidFolderName(folder)) return res.status(400).json({ error: 'Invalid folder name' });
 
@@ -124,6 +124,7 @@ router.get('/messages', async (req, res) => {
     unreadOnly,
     threaded,
     category: safeCategory,
+    tag: req.query.tag,
   });
 
   if (resolvedAccountId && messages.length) {
@@ -132,6 +133,41 @@ router.get('/messages', async (req, res) => {
   }
 
   res.json({ messages, total, ...(isThreaded ? { threaded: true } : {}) });
+});
+
+// Get all unique custom IMAP tags (keywords) across a user's accounts
+router.get('/tags', async (req, res) => {
+  const { accountId } = req.query;
+  try {
+    const accountsResult = await query(
+      'SELECT id FROM email_accounts WHERE user_id = $1 AND enabled = true',
+      [req.session.userId]
+    );
+    const userAccountIds = accountsResult.rows.map(r => r.id);
+    if (!userAccountIds.length) return res.json({ tags: [] });
+
+    const filterIds = accountId && userAccountIds.includes(accountId)
+      ? [accountId]
+      : userAccountIds;
+
+    const result = await query(`
+      SELECT DISTINCT jsonb_array_elements_text(flags) AS tag
+      FROM messages
+      WHERE account_id = ANY($1)
+        AND is_deleted = false
+        AND flags != '[]'::jsonb
+      ORDER BY tag
+    `, [filterIds]);
+
+    const tags = result.rows
+      .map(r => r.tag)
+      .filter(t => !t.startsWith('\\') && !t.startsWith('$') && !/^(Junk|JunkRecorded|NonJunk|NotJunk|MDNSent|Forwarded)$/i.test(t));
+
+    res.json({ tags });
+  } catch (err) {
+    console.error('GET /tags error:', err.message);
+    res.status(500).json({ error: 'Failed to load tags' });
+  }
 });
 
 router.get('/messages/:id', async (req, res) => {
@@ -143,7 +179,7 @@ router.get('/messages/:id', async (req, res) => {
              m.from_name, m.from_email, m.to_addresses, m.cc_addresses,
              m.reply_to, m.in_reply_to,
              m.date, m.snippet, m.is_read, m.is_starred,
-             m.has_attachments, m.account_id, m.category,
+             m.has_attachments, m.account_id, m.category, m.flags,
              m.list_unsubscribe, m.list_unsubscribe_post, m.unsubscribed_at,
              a.name AS account_name, a.email_address AS account_email,
              a.color AS account_color
@@ -180,7 +216,7 @@ router.get('/resolve-message', async (req, res) => {
              m.from_name, m.from_email, m.to_addresses, m.cc_addresses,
              m.reply_to, m.in_reply_to,
              m.date, m.snippet, m.is_read, m.is_starred,
-             m.has_attachments, m.account_id, m.category,
+             m.has_attachments, m.account_id, m.category, m.flags,
              m.list_unsubscribe, m.list_unsubscribe_post, m.unsubscribed_at,
              a.name AS account_name, a.email_address AS account_email,
              a.color AS account_color`;
@@ -257,7 +293,7 @@ router.get('/thread/:threadId', async (req, res) => {
                m.from_name, m.from_email, m.to_addresses, m.cc_addresses,
                m.reply_to, m.in_reply_to,
                m.date, m.snippet, m.is_read, m.is_starred,
-               m.has_attachments, m.account_id, m.category,
+               m.has_attachments, m.account_id, m.category, m.flags,
                m.list_unsubscribe, m.list_unsubscribe_post, m.unsubscribed_at,
                a.name AS account_name, a.email_address AS account_email, a.color AS account_color
         FROM messages m

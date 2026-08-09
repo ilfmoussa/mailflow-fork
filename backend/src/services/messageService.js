@@ -1,6 +1,6 @@
 import { query } from './db.js';
 
-export async function listMessages({ userId, accountId, folder = 'INBOX', limit = 50, offset = 0, unreadOnly, threaded, category }) {
+export async function listMessages({ userId, accountId, folder = 'INBOX', limit = 50, offset = 0, unreadOnly, threaded, category, tag }) {
   const accountsResult = await query(
     'SELECT id FROM email_accounts WHERE user_id = $1 AND enabled = true',
     [userId]
@@ -35,6 +35,11 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
     values.push(safeCategory);
   } else if (safeCategory === 'primary') {
     whereConditions.push(`(m.category IS NULL OR m.category = 'primary')`);
+  }
+
+  if (tag) {
+    whereConditions.push(`m.flags @> $${p++}::jsonb`);
+    values.push(JSON.stringify([tag]));
   }
 
   const where = whereConditions.join(' AND ');
@@ -94,7 +99,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
                m.subject, m.from_name, m.from_email,
                m.to_addresses, m.cc_addresses, m.reply_to, m.in_reply_to,
                m.date, m.snippet, m.is_read, m.is_starred,
-               m.has_attachments, m.account_id, m.category,
+               m.has_attachments, m.account_id, m.category, m.flags,
                m.list_unsubscribe, m.list_unsubscribe_post,
                a.name  AS account_name,
                a.email_address AS account_email,
@@ -141,7 +146,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
              to_addresses, cc_addresses, reply_to, in_reply_to,
              date, snippet, is_starred, is_read, has_attachments, account_id,
              account_name, account_email, account_color,
-             category, list_unsubscribe, list_unsubscribe_post,
+             category, flags, list_unsubscribe, list_unsubscribe_post,
              message_count, unread_count,
              thread_has_contact_photo AS has_contact_photo
       FROM ranked
@@ -171,7 +176,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
     SELECT m.id, m.uid, m.folder, m.message_id, m.subject, m.from_name, m.from_email,
            m.to_addresses, m.cc_addresses, m.reply_to, m.in_reply_to,
            m.date, m.snippet, m.is_read, m.is_starred,
-           m.has_attachments, m.account_id, m.category,
+           m.has_attachments, m.account_id, m.category, m.flags,
            m.list_unsubscribe, m.list_unsubscribe_post,
            a.name as account_name, a.email_address as account_email, a.color as account_color,
            (co.id IS NOT NULL) AS has_contact_photo

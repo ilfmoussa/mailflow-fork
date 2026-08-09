@@ -346,6 +346,19 @@ export const useStore = create((set, get) => ({
   searchResults: [],
   setSearchResults: (r) => set({ searchResults: r }),
 
+  // Tag filtering
+  selectedTag: null,
+  setSelectedTag: (tag) => set({ selectedTag: tag }),
+  availableTags: [],
+  fetchTags: async (accountId) => {
+    try {
+      const data = await api.getTags(accountId || undefined);
+      set({ availableTags: data.tags || [] });
+    } catch {
+      set({ availableTags: [] });
+    }
+  },
+
   // Loading
   loadingMessages: false,
   setLoadingMessages: (v) => set({ loadingMessages: v }),
