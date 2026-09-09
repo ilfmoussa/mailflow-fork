@@ -1580,7 +1580,7 @@ export default function Sidebar() {
                           onClick={() => handleStartCreateFolder(account.id)}
                           style={{
                             display: 'flex', alignItems: 'center', gap: 8,
-                            padding: '5px 10px 5px 26px', borderRadius: 7,
+                            padding: '5px 10px 5px 26px', borderRadius: 0,
                             background: folderBg, border: 'none', cursor: 'pointer',
                             color: 'var(--text-tertiary)', fontSize: 11, width: '100%',
                             transition: 'color 0.1s, background 0.1s',
