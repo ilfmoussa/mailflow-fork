@@ -1407,6 +1407,8 @@ export default function Sidebar() {
                           padding: `6px 10px 6px ${indent}px`, borderRadius: 7,
                           cursor: isRenaming ? 'default' : 'pointer',
                           background: (msgDragTarget === `${account.id}:${folder.path}`) ? 'var(--accent-dim)' : isFolderSelected ? folderBgSelected : folderBg,
+                          // Fork: fine séparation entre dossiers (laisse voir le fond de la sidebar)
+                          borderBottom: '1px solid var(--bg-primary)',
                           transition: 'background 0.1s',
                           boxShadow: dropPosition === 'before'
                             ? 'inset 0 2px var(--accent)'
@@ -1577,12 +1579,12 @@ export default function Sidebar() {
                           style={{
                             display: 'flex', alignItems: 'center', gap: 8,
                             padding: '5px 10px 5px 26px', borderRadius: 7,
-                            background: 'none', border: 'none', cursor: 'pointer',
+                            background: folderBg, border: 'none', cursor: 'pointer',
                             color: 'var(--text-tertiary)', fontSize: 11, width: '100%',
-                            transition: 'color 0.1s',
+                            transition: 'color 0.1s, background 0.1s',
                           }}
-                          onMouseEnter={e => e.currentTarget.style.color = 'var(--text-secondary)'}
-                          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-tertiary)'}
+                          onMouseEnter={e => { e.currentTarget.style.color = 'var(--text-secondary)'; e.currentTarget.style.background = folderBgHover; }}
+                          onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-tertiary)'; e.currentTarget.style.background = folderBg; }}
                         >
                           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                             <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
