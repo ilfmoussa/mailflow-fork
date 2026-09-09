@@ -33,6 +33,74 @@ async function request(method, path, body, extraHeaders) {
   return res.json();
 }
 
+export async function streamAiChat(messages, { signal, onDelta } = {}) {
+  const response = await fetch(`${BASE}/ai/chat`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', [CSRF_HEADER]: CSRF_VALUE },
+    body: JSON.stringify({ messages }),
+    signal,
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'AI request failed' }));
+    throw new Error(error.error || 'AI request failed');
+  }
+  if (!response.body) throw new Error('AI response body is unavailable');
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+  let completed = false;
+
+  function consumeLine(line) {
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data) return;
+    if (data === '[DONE]') {
+      completed = true;
+      return;
+    }
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed?.error) {
+        const message = typeof parsed.error === 'string' ? parsed.error : parsed.error.message;
+        throw new Error(message || 'AI request failed');
+      }
+      const delta = parsed?.choices?.[0]?.delta?.content;
+      if (typeof delta === 'string' && delta) {
+        fullText += delta;
+        onDelta?.(fullText, delta);
+      }
+    } catch (error) {
+      if (error instanceof SyntaxError) return;
+      throw error;
+    }
+  }
+
+  try {
+    while (!completed) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        consumeLine(line);
+        if (completed) break;
+      }
+    }
+    if (!completed && buffer) consumeLine(buffer);
+    if (!completed) throw new Error('AI response ended before completion');
+    return fullText;
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
+
 function getMessageBody(id, remoteImages = false) {
   const key = `${id}:${remoteImages ? 'remote' : 'blocked'}`;
   const existing = messageBodyRequests.get(key);
@@ -79,6 +147,18 @@ export const api = {
   resetPassword: (token, password) => request('POST', '/auth/reset-password', { token, password }),
   getPreferences: () => request('GET', '/auth/preferences'),
   savePreferences: (prefs) => request('PATCH', '/auth/preferences', prefs),
+  // The same write, but issued while the page is going away. keepalive lets the browser
+  // finish the request after the document is gone; an ordinary fetch is cancelled and the
+  // setting is lost, then overwritten by the older server value on the next load. Bypasses
+  // request() deliberately: there is no point parsing a response nobody will see, and the
+  // 401/423 events it dispatches cannot be acted on during unload.
+  savePreferencesOnExit: (prefs) => fetch(BASE + '/auth/preferences', {
+    method: 'PATCH',
+    credentials: 'include',
+    keepalive: true,
+    headers: { 'Content-Type': 'application/json', [CSRF_HEADER]: CSRF_VALUE },
+    body: JSON.stringify(prefs),
+  }),
   updateProfile: (data) => request('PATCH', '/auth/profile', data),
   uploadAvatar: (avatar) => request('POST', '/auth/avatar', { avatar }),
   deleteAvatar: () => request('DELETE', '/auth/avatar'),
@@ -160,9 +240,12 @@ export const api = {
     return request('GET', `/mail/resolve-message?${qs}`);
   },
   getMessageBody,
-  getThread: (threadId, folder) => {
-    const qs = folder ? `?folder=${encodeURIComponent(folder)}` : '';
-    return request('GET', `/mail/thread/${encodeURIComponent(threadId)}${qs}`);
+  getThread: (threadId, folder, unified = false) => {
+    const qs = new URLSearchParams();
+    if (folder) qs.set('folder', folder);
+    if (unified) qs.set('unified', 'true');
+    const query = qs.size ? `?${qs}` : '';
+    return request('GET', `/mail/thread/${encodeURIComponent(threadId)}${query}`);
   },
   bulkRead: (ids, read) => request('POST', '/mail/messages/bulk-read', { ids, read }),
   markStarred: (id, starred) => request('PATCH', `/mail/messages/${id}/star`, { starred }),
@@ -173,6 +256,11 @@ export const api = {
   bulkArchive: (ids) => request('POST', '/mail/messages/bulk-archive', { ids }),
   getUnreadCounts: () => request('GET', '/mail/unread-counts'),
 
+  // Mailbox cleanup (read-only analysis; actual cleanup reuses bulkDelete above).
+  mailboxUsage: (accountId) => request('GET', `/mail/mailbox-usage?accountId=${encodeURIComponent(accountId)}`),
+  cleanupPreview: (accountId, fromEmail) =>
+    request('GET', `/mail/cleanup-preview?accountId=${encodeURIComponent(accountId)}&fromEmail=${encodeURIComponent(fromEmail)}`),
+
   // Antispam (v0.1) — manual user feedback.
   // markSpam moves the message to the account's spam/junk folder and
   // records the decision in spam_training_log. markHam moves it back to
@@ -182,6 +270,9 @@ export const api = {
 
   getMessageHeaders: (id) => request('GET', `/mail/messages/${id}/headers`),
   snoozeMessage: (id, until) => request('POST', `/mail/messages/${id}/snooze`, { until }),
+
+  // Sanitized diagnostics report (server-owned sections; scoped to the user).
+  diagnosticsReport: (salt) => request('POST', '/diagnostics/report', { salt }),
 
   // Integrations
   getIntegrations: () => request('GET', '/integrations'),
@@ -278,6 +369,14 @@ export const api = {
     deleteConfig: () => request('DELETE', '/admin/ai'),
     test: () => request('POST', '/admin/ai/test'),
     status: () => request('GET', '/ai/status'),
+    chat: streamAiChat,
+    codex: {
+      start: () => request('POST', '/admin/ai/codex/device'),
+      poll: (flowId) => request('POST', '/admin/ai/codex/device/poll', { flowId }),
+      status: () => request('GET', '/admin/ai/codex/status'),
+      cancel: (flowId) => request('DELETE', '/admin/ai/codex/device', { flowId }),
+      disconnect: () => request('DELETE', '/admin/ai/codex'),
+    },
   },
 
   getTags: (accountId) => {
@@ -317,6 +416,7 @@ export const api = {
     return request('GET', `/gtd/sections${qs ? '?' + qs : ''}`);
   },
   gtdClassify: (messageId, state) => request('POST', '/gtd/classify', { messageId, state }),
+  gtdUndoClassify: (undoToken) => request('POST', '/gtd/classify/undo', undoToken),
   gtdUnclassify: (messageId, state) => request('DELETE', '/gtd/classify', { messageId, state }),
   // GTD "done": strip the row's label(s) for these states, mark read, archive the INBOX
   // copy. id is the rail head's row id (its label-folder copy); the server resolves the
@@ -330,6 +430,13 @@ export const api = {
   importGtdPet: (payload) => request('POST', '/gtd/pet/import', payload),
   getGtdPetMeta: (slug) => request('GET', `/gtd/pet/${encodeURIComponent(slug)}/meta`),
   gtdPetSheetUrl: (slug) => `${BASE}/gtd/pet/${encodeURIComponent(slug)}/sheet`,
+
+  // Plugins — registered plugins for this build plus the user's per-user activation. Activation is
+  // independent of a plugin's own per-account config (e.g. GTD's gtd_enabled).
+  plugins: {
+    list: () => request('GET', '/plugins'),
+    setActivated: (id, activated) => request('PATCH', `/plugins/${encodeURIComponent(id)}`, { activated }),
+  },
 
   // Todoist integration
   todoist: {

@@ -5,8 +5,10 @@ import { api } from '../utils/api.js';
 import { installCapacitorNativeBridge } from '../utils/capacitorNativeBridge.js';
 import { playNotificationSound } from '../utils/notificationSounds.js';
 import { pendingMarkReadMap } from '../utils/pendingReads.js';
-import { gtdActiveForContext } from '../utils/gtd.js';
 import { updateFaviconBadge } from '../themes.js';
+import { dispatchPluginWsMessage, dispatchPluginReconnect } from '../plugins/events.js';
+import { accountAffectsUnifiedInbox } from '../utils/unifiedInbox.js';
+import { recordDiagEvent } from '../utils/diagEvents.js';
 
 // Compute the correct favicon count given unread counts and the currently
 // selected account. Reads selectedAccountId from the store directly so this
@@ -29,15 +31,20 @@ function _faviconCount(counts) {
 // (current optimistic + pending size). If the server count is already lower,
 // the DB has applied those reads and subtracting again would double-count.
 function _applyServerCounts(counts) {
+  const _before = useStore.getState().unreadCounts.total;
   if (pendingMarkReadMap.size > 0) {
-    const current = useStore.getState().unreadCounts;
-    if (counts.total >= current.total + pendingMarkReadMap.size) {
+    const state = useStore.getState();
+    const current = state.unreadCounts;
+    const pendingUnifiedCount = [...pendingMarkReadMap.values()]
+      .filter(accountId => accountAffectsUnifiedInbox(state.accounts, accountId))
+      .length;
+    if (counts.total >= current.total + pendingUnifiedCount) {
       // Server hasn't incorporated in-flight reads yet — subtract them.
       const byAccount = { ...counts.byAccount };
       for (const accountId of pendingMarkReadMap.values()) {
         if (byAccount[accountId] > 0) byAccount[accountId]--;
       }
-      const total = Math.max(0, counts.total - pendingMarkReadMap.size);
+      const total = Math.max(0, counts.total - pendingUnifiedCount);
       useStore.setState({ unreadCounts: { total, byAccount } });
     } else {
       // DB already applied the reads — use the authoritative count directly.
@@ -46,6 +53,7 @@ function _applyServerCounts(counts) {
   } else {
     useStore.setState({ unreadCounts: counts });
   }
+  recordDiagEvent({ category: 'unread', cause: 'server_counts', beforeTotal: _before, afterTotal: useStore.getState().unreadCounts.total });
 }
 
 async function _forwardNativeNewMailNotification(notification) {
@@ -116,16 +124,15 @@ export function useWebSocket() {
       ws._pingInterval = pingInterval;
       // On reconnect, catch up on any messages that arrived during the outage
       if (wasReconnect) {
+        recordDiagEvent({ category: 'ws', type: 'reconnect' });
         window.dispatchEvent(new CustomEvent('mailflow:refresh'));
         api.getUnreadCounts().then(counts => {
           useStore.setState({ unreadCounts: counts });
         }).catch(() => {});
-        // Rail sections can drift during the outage — gtd_sections_updated events
-        // fired while the socket was down are lost, not buffered. Refetch them the
-        // same way we refresh messages/unread, but only for GTD users so a non-GTD
-        // context adds no extra traffic on every reconnect.
-        const { accounts, selectedAccountId, scheduleGtdSectionsFetch } = useStore.getState();
-        if (gtdActiveForContext(accounts, selectedAccountId)) scheduleGtdSectionsFetch();
+        // A plugin's rail/derived data can drift during the outage — events fired while the socket
+        // was down are lost, not buffered. Let each activated plugin resync (GTD refetches its
+        // sections). Core stays plugin-agnostic.
+        dispatchPluginReconnect();
       }
     };
 
@@ -166,6 +173,10 @@ export function useWebSocket() {
         const alertCount = data.alertCount ?? count;
         const isInbox = !folder || folder === 'INBOX';
 
+        // Note: no raw folder name here — a custom folder name would be identifying,
+        // and the scrub net only catches emails/IPs/tokens. isInbox is the safe signal.
+        recordDiagEvent({ category: 'event', type: 'new_messages', accountId, isInbox, count, alertCount });
+
         if (messages && messages.length > 0) {
           // In-app notifications and sounds are inbox-only — non-inbox folder syncs
           // (Archive, Spam, on-demand syncs) should not trigger alerts for old mail.
@@ -195,7 +206,7 @@ export function useWebSocket() {
           // Refresh the message list when the affected folder is visible
           const store = useStore.getState();
           const isRelevant =
-            store.selectedAccountId === null ||
+            (store.selectedAccountId === null && accountAffectsUnifiedInbox(store.accounts, accountId)) ||
             store.selectedAccountId === accountId;
           const folderVisible = store.selectedFolder === (folder || 'INBOX');
 
@@ -223,8 +234,12 @@ export function useWebSocket() {
         const counts = useStore.getState().unreadCounts;
         const byAccount = { ...counts.byAccount };
         byAccount[accountId] = (byAccount[accountId] || 0) + delta;
-        const newCounts = { total: counts.total + delta, byAccount };
+        const total = accountAffectsUnifiedInbox(useStore.getState().accounts, accountId)
+          ? counts.total + delta
+          : counts.total;
+        const newCounts = { total, byAccount };
         useStore.setState({ unreadCounts: newCounts });
+        recordDiagEvent({ category: 'unread', cause: 'exists_hint', accountId, delta, beforeTotal: counts.total, afterTotal: total });
         // Update favicon immediately — do not wait for React's render cycle.
         // With a pre-cached base this is synchronous (no image load round-trip).
         updateFaviconBadge(_faviconCount(newCounts));
@@ -290,7 +305,9 @@ export function useWebSocket() {
         // visible, refresh counts for sidebar badges, but no sounds/notifications.
         const { accountId: fuAccountId } = data;
         const fuStore = useStore.getState();
-        const fuRelevant = fuStore.selectedAccountId === null || fuStore.selectedAccountId === fuAccountId;
+        const fuRelevant =
+          (fuStore.selectedAccountId === null && accountAffectsUnifiedInbox(fuStore.accounts, fuAccountId)) ||
+          fuStore.selectedAccountId === fuAccountId;
         if (fuRelevant) {
           window.dispatchEvent(new CustomEvent('mailflow:refresh'));
           window.dispatchEvent(new CustomEvent('mailflow:sync_done'));
@@ -308,6 +325,20 @@ export function useWebSocket() {
         // Re-fetch per-folder counts for the affected account so sidebar folder
         // badges stay in sync (unread_count, total_count). Only refresh accounts
         // whose folders are already loaded to avoid unnecessary requests.
+        if (data.accountId && useStore.getState().folders[data.accountId]) {
+          api.getFolders(data.accountId).then(f => setFolders(data.accountId, f)).catch(() => {});
+        }
+        break;
+      }
+
+      case 'folder_emptied': {
+        // Background empty finished (see mail.js /folders/empty). Toast the outcome and refresh
+        // the view and counts either way — on failure the messages are still on the server and
+        // should reappear.
+        addNotification({ title: data.ok ? t('sidebar.emptied') : t('sidebar.emptyFailed') });
+        window.dispatchEvent(new CustomEvent('mailflow:refresh'));
+        window.dispatchEvent(new CustomEvent('mailflow:sync_done'));
+        api.getUnreadCounts().then(_applyServerCounts).catch(() => {});
         if (data.accountId && useStore.getState().folders[data.accountId]) {
           api.getFolders(data.accountId).then(f => setFolders(data.accountId, f)).catch(() => {});
         }
@@ -332,19 +363,6 @@ export function useWebSocket() {
         break;
       }
 
-      case 'gtd_sections_updated': {
-        // GTD label folders changed (tick, classify copy/remove, or a transition
-        // strip). Refetch the rail/tab sections — NOT gated on selectedFolder
-        // (label folders never become the selected folder), debounced in the
-        // store since this can fire several times per tick. Only refetch when the
-        // event's account is in the current rail scope (unified sees every account).
-        const store = useStore.getState();
-        if (store.selectedAccountId === null || store.selectedAccountId === data.accountId) {
-          store.scheduleGtdSectionsFetch();
-        }
-        break;
-      }
-
       case 'message_flags': {
         // A read/star flag changed on ANOTHER of this user's devices. Apply it to the matching
         // rows in place — no full folder refetch (that would flicker and refetch-storm while
@@ -366,6 +384,11 @@ export function useWebSocket() {
         }
         break;
       }
+
+      default:
+        // A message type core doesn't handle — hand it to any activated plugin that registered for
+        // it (e.g. GTD's 'gtd_sections_updated'). No-op when nothing is registered.
+        dispatchPluginWsMessage(data);
     }
   }, [addNotification, updateAccount, setFolders, setBackfillProgress, t]);
 

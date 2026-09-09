@@ -1,9 +1,18 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, shell, dialog, Notification, session } = require('electron');
-const { execFileSync, spawn } = require('child_process');
+const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, shell, dialog, Notification, session, clipboard } = require('electron');
+const { execFileSync, spawn, spawnSync } = require('child_process');
+const { createHash } = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const { pathToFileURL } = require('url');
+const {
+  createNavigationPolicy,
+  hasMatchingMacTeam,
+  hasMatchingWindowsPublisher,
+  isSameOrigin,
+  normalizeHost,
+} = require('./security.cjs');
 
 const CONFIG_FILE = 'mailflow-host.json';
 const UPDATE_STATUS_CHANNEL = 'mailflow:updates:status';
@@ -156,23 +165,6 @@ function clearHost() {
   const config = readConfig();
   delete config.host;
   writeConfig(config);
-}
-
-function normalizeHost(value) {
-  const input = String(value || '').trim();
-  const url = new URL(input);
-
-  if (!['https:', 'http:'].includes(url.protocol)) {
-    throw new Error('Host must start with https:// or http://');
-  }
-
-  url.username = '';
-  url.password = '';
-  url.hash = '';
-  url.search = '';
-  url.pathname = '/';
-
-  return url.toString().replace(/\/$/, '');
 }
 
 function requestJson(url) {
@@ -487,7 +479,7 @@ function showInAppNotification({ title = '', message = '', type = 'info', action
       body.textContent = notification.message;
       body.style.fontSize = '12px';
       body.style.color = '#9898a8';
-      body.style.whiteSpace = 'normal';
+      body.style.whiteSpace = 'pre-wrap';
       body.style.overflow = 'visible';
       body.style.textOverflow = 'clip';
       body.style.lineHeight = '1.35';
@@ -519,6 +511,8 @@ function showInAppNotification({ title = '', message = '', type = 'info', action
         action.addEventListener('click', () => {
           if (notification.action === 'install-update') {
             window.mailflowNative?.updates?.installDownloaded?.();
+          } else if (notification.action === 'copy-update-command-and-quit') {
+            window.mailflowNative?.updates?.copyInstallCommandAndQuit?.();
           }
           dismiss();
         });
@@ -725,6 +719,12 @@ function notifyUpdateAvailable(verbose = true) {
 }
 
 function notifyUpdateDownloaded() {
+  const linuxInstallCommand = getLinuxUpdateInstallCommand(downloadedUpdate);
+  const isLinuxManualInstall = Boolean(linuxInstallCommand);
+  const linuxInstallMessage = linuxInstallCommand
+    ? `MailFlow downloaded and verified the update. Install it from a terminal with:\n${linuxInstallCommand}`
+    : null;
+
   sendUpdateStatus({
     type: 'downloaded',
     data: {
@@ -733,17 +733,61 @@ function notifyUpdateDownloaded() {
       releaseDate: updateInfo && updateInfo.releaseDate,
       updateUrl: updateInfo && updateInfo.updateUrl,
       filePath: downloadedUpdate,
+      installCommand: linuxInstallCommand,
+      manualInstall: isLinuxManualInstall,
       manual: true,
     },
   });
   showInAppNotification({
     title: 'Update Ready',
-    message: 'MailFlow downloaded the update.',
+    message: linuxInstallMessage || 'MailFlow downloaded the update.',
     type: 'positive',
-    actionLabel: 'Install',
-    action: 'install-update',
+    actionLabel: isLinuxManualInstall ? 'Copy & Quit' : 'Install',
+    action: isLinuxManualInstall ? 'copy-update-command-and-quit' : 'install-update',
     persistent: true,
   });
+}
+
+function toLinuxInstructionPath(filePath) {
+  if (process.platform !== 'linux' || !filePath) return null;
+
+  const normalizedPath = path.resolve(filePath);
+  const homePath = path.resolve(app.getPath('home'));
+  const relativeToHome = path.relative(homePath, normalizedPath);
+
+  if (relativeToHome && !relativeToHome.startsWith('..') && !path.isAbsolute(relativeToHome)) {
+    return `$HOME/${relativeToHome.split(path.sep).join('/')}`;
+  }
+
+  return normalizedPath.split(path.sep).join('/');
+}
+
+function quoteLinuxCommandPath(filePath) {
+  const displayPath = toLinuxInstructionPath(filePath);
+  if (!displayPath) return null;
+
+  const escaped = displayPath.startsWith('$HOME/')
+    ? displayPath.replace(/(["\\`])/g, '\\$1')
+    : displayPath.replace(/(["\\$`])/g, '\\$1');
+  return `"${escaped}"`;
+}
+
+function getLinuxUpdateInstallCommand(filePath) {
+  if (process.platform !== 'linux' || !filePath) return null;
+
+  const quotedPath = quoteLinuxCommandPath(filePath);
+  if (!quotedPath) return null;
+  const packageName = `${filePath} ${updateInfo?.assetName || ''}`;
+
+  if (/\.deb(?:\s|$)/i.test(packageName)) {
+    return `sudo apt install ${quotedPath}`;
+  }
+
+  if (/\.rpm(?:\s|$)/i.test(packageName)) {
+    return `sudo dnf install ${quotedPath}`;
+  }
+
+  return null;
 }
 
 function filePostfix() {
@@ -766,35 +810,93 @@ function setDownloadProgress(window, value) {
   }
 }
 
-function getLinuxTerminalCommand() {
-  return getAvailableCommand([
-    'ptyxis',
-    'kgx',
-    'gnome-terminal',
-    'konsole',
-    'xterm',
-    'x-terminal-emulator',
-  ]);
+function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
 }
 
-function getTerminalArgs(terminal, command, args = []) {
-  const shellCommand = ['sh', '-lc', 'exec "$@"', 'mailflow-installer', command, ...args];
-  if (['ptyxis', 'kgx', 'gnome-terminal'].includes(terminal)) return ['--', ...shellCommand];
-  return ['-e', ...shellCommand];
+async function verifyExpectedDigest(filePath) {
+  const digest = String(updateInfo?.digest || '').trim();
+  if (!digest) return;
+
+  const match = digest.match(/^sha256:([a-f0-9]{64})$/i);
+  if (!match) throw new Error('The release asset has an unsupported digest.');
+
+  const actual = await hashFile(filePath);
+  if (actual.toLowerCase() !== match[1].toLowerCase()) {
+    throw new Error('The update digest does not match the release asset.');
+  }
 }
 
-function launchTerminalCommand(command, args = []) {
-  const terminal = getLinuxTerminalCommand();
-  if (!terminal) {
-    throw new Error('No supported terminal was found.');
+function readWindowsSignature(filePath) {
+  const script = [
+    '$signature = Get-AuthenticodeSignature -LiteralPath $args[0]',
+    '[pscustomobject]@{',
+    '  status = [string]$signature.Status',
+    '  subject = [string]$signature.SignerCertificate.Subject',
+    '} | ConvertTo-Json -Compress',
+  ].join('\n');
+  const output = execFileSync('powershell.exe', [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    script,
+    filePath,
+  ], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  return JSON.parse(output);
+}
+
+function readMacSignatureDetails(filePath) {
+  const result = spawnSync('codesign', ['--display', '--verbose=4', filePath], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || 'Could not read the code signature.');
+  }
+  return `${result.stdout || ''}\n${result.stderr || ''}`;
+}
+
+function verifyPlatformSignature(filePath) {
+  if (process.platform === 'win32') {
+    const installed = readWindowsSignature(process.execPath);
+    const downloaded = readWindowsSignature(filePath);
+    if (!hasMatchingWindowsPublisher(installed, downloaded)) {
+      throw new Error('The update is not signed by the installed MailFlow publisher.');
+    }
+    return;
   }
 
-  const child = spawn(terminal, getTerminalArgs(terminal, command, args), {
-    detached: true,
-    stdio: 'ignore',
-  });
+  if (process.platform === 'darwin') {
+    execFileSync('codesign', ['--verify', '--deep', '--strict', filePath], { stdio: 'ignore' });
+    execFileSync('spctl', [
+      '--assess',
+      '--type',
+      'open',
+      '--context',
+      'context:primary-signature',
+      filePath,
+    ], { stdio: 'ignore' });
 
-  child.unref();
+    const installed = readMacSignatureDetails(process.execPath);
+    const downloaded = readMacSignatureDetails(filePath);
+    if (!hasMatchingMacTeam(installed, downloaded)) {
+      throw new Error('The update is not signed by the installed MailFlow team.');
+    }
+  }
+}
+
+async function verifyDownloadedUpdate(filePath) {
+  await verifyExpectedDigest(filePath);
+  verifyPlatformSignature(filePath);
 }
 
 function isUpdateDownloadItem(item) {
@@ -827,7 +929,7 @@ function initializeUpdateDownloads(window) {
       }
     });
 
-    item.on('done', (_event, state) => {
+    item.on('done', async (_event, state) => {
       setDownloadProgress(window, -1);
 
       if (state === 'interrupted') {
@@ -835,8 +937,16 @@ function initializeUpdateDownloads(window) {
       }
 
       if (state === 'completed') {
-        downloadedUpdate = item.getSavePath();
-        notifyUpdateDownloaded();
+        const updatePath = item.getSavePath();
+        try {
+          await verifyDownloadedUpdate(updatePath);
+          downloadedUpdate = updatePath;
+          notifyUpdateDownloaded();
+        } catch (error) {
+          downloadedUpdate = null;
+          console.error('Downloaded update failed security verification:', error);
+          notifyUpdateError('The downloaded update could not be verified and will not be opened.');
+        }
       }
 
       pendingUpdateDownloadUrl = null;
@@ -871,6 +981,8 @@ async function checkForUpdates(verbose = false) {
     }
 
     updateInfo = {
+      digest: asset.digest || null,
+      assetName: asset.name || '',
       releaseNotes: release.body || '',
       releaseName: release.name || release.tag_name,
       releaseDate: release.published_at,
@@ -888,6 +1000,14 @@ async function checkForUpdates(verbose = false) {
 }
 
 function launchDownloadedUpdate(updatePath) {
+  const linuxInstallCommand = getLinuxUpdateInstallCommand(updatePath);
+  if (linuxInstallCommand) {
+    const error = new Error('Manual installation is required for Linux packages.');
+    error.code = 'MANUAL_LINUX_INSTALL';
+    error.installCommand = linuxInstallCommand;
+    throw error;
+  }
+
   if (process.platform === 'win32' && /\.exe$/i.test(updatePath)) {
     const child = spawn(updatePath, [], {
       detached: true,
@@ -896,21 +1016,6 @@ function launchDownloadedUpdate(updatePath) {
     });
 
     child.unref();
-    return Promise.resolve();
-  }
-
-  if (process.platform === 'linux' && /\.deb$/i.test(updatePath)) {
-    launchTerminalCommand('sudo', ['dpkg', '--install', updatePath]);
-    return Promise.resolve();
-  }
-
-  if (process.platform === 'linux' && /\.rpm$/i.test(updatePath)) {
-    const packageInstaller = getAvailableCommand(['dnf', 'dnf5', 'yum']);
-    if (!packageInstaller) {
-      throw new Error('No RPM package installer was found.');
-    }
-
-    launchTerminalCommand('sudo', [packageInstaller, 'install', updatePath]);
     return Promise.resolve();
   }
 
@@ -924,6 +1029,15 @@ function installDownloadedUpdate() {
     return Promise.resolve({ installed: false, reason: 'missing-download' });
   }
 
+  const linuxInstallCommand = getLinuxUpdateInstallCommand(downloadedUpdate);
+  if (linuxInstallCommand) {
+    return Promise.resolve({
+      installed: false,
+      reason: 'manual-install-required',
+      installCommand: linuxInstallCommand,
+    });
+  }
+
   return new Promise((resolve) => {
     fs.access(downloadedUpdate, fs.constants.F_OK, async (error) => {
       if (error) {
@@ -933,11 +1047,21 @@ function installDownloadedUpdate() {
       }
 
       try {
+        await verifyDownloadedUpdate(downloadedUpdate);
         await launchDownloadedUpdate(downloadedUpdate);
         isQuitting = true;
         setTimeout(() => app.quit(), 500);
         resolve({ installed: true });
       } catch (launchError) {
+        if (launchError.code === 'MANUAL_LINUX_INSTALL') {
+          resolve({
+            installed: false,
+            reason: 'manual-install-required',
+            installCommand: launchError.installCommand,
+          });
+          return;
+        }
+
         console.error('Could not launch downloaded update:', launchError);
         shell.showItemInFolder(downloadedUpdate);
         notifyUpdateError('The update was downloaded, but MailFlow could not start the installer.');
@@ -945,6 +1069,22 @@ function installDownloadedUpdate() {
       }
     });
   });
+}
+
+function copyLinuxUpdateCommandAndQuit({ installCommand, filePath } = {}) {
+  const linuxInstallCommand = getLinuxUpdateInstallCommand(downloadedUpdate)
+    || getLinuxUpdateInstallCommand(filePath);
+  if (!linuxInstallCommand) {
+    return { copied: false, reason: downloadedUpdate ? 'not-linux-package' : 'missing-download' };
+  }
+
+  const requestedCommand = typeof installCommand === 'string' ? installCommand.trim() : '';
+  const commandToCopy = requestedCommand === linuxInstallCommand ? requestedCommand : linuxInstallCommand;
+
+  clipboard.writeText(commandToCopy);
+  isQuitting = true;
+  setTimeout(() => app.quit(), 1250);
+  return { copied: true, installCommand: commandToCopy };
 }
 
 function openDownloadedUpdatePath() {
@@ -1049,20 +1189,9 @@ function sendNativeAction(action, data = {}) {
   const payload = createNativeActionPayload(action, data);
   showMainWindow();
 
-  const dispatchScript = `
-    window.dispatchEvent(new CustomEvent('mailflow:native-action', {
-      detail: ${JSON.stringify(payload)}
-    }));
-    window.postMessage({
-      type: 'mailflow:native-action',
-      payload: ${JSON.stringify(payload)}
-    }, '*');
-  `;
-
   const send = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send(NATIVE_ACTION_CHANNEL, payload);
-    mainWindow.webContents.executeJavaScript(dispatchScript).catch(() => {});
   };
 
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -1270,6 +1399,60 @@ function setupMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+function showContextMenu(webContents, params) {
+  const template = [];
+  const hasSelection = Boolean(params.selectionText && params.selectionText.trim());
+  const hasLink = Boolean(params.linkURL);
+  const hasImage = params.mediaType === 'image' && Boolean(params.srcURL);
+
+  if (params.isEditable) {
+    template.push(
+      { label: 'Cut', role: 'cut' },
+      { label: 'Copy', role: 'copy', enabled: hasSelection },
+      { label: 'Paste', role: 'paste' },
+      { type: 'separator' },
+      { label: 'Select All', role: 'selectAll' },
+    );
+  } else {
+    if (hasLink) {
+      template.push(
+        {
+          label: 'Open Link',
+          click: () => {
+            if (isAllowedExternalUrl(params.linkURL)) shell.openExternal(params.linkURL);
+          },
+        },
+        {
+          label: 'Copy Link',
+          click: () => clipboard.writeText(params.linkURL),
+        },
+      );
+    }
+
+    if (hasImage) {
+      if (template.length > 0) template.push({ type: 'separator' });
+      template.push({
+        label: 'Copy Image Address',
+        click: () => clipboard.writeText(params.srcURL),
+      });
+    }
+
+    if (hasSelection) {
+      if (template.length > 0) template.push({ type: 'separator' });
+      template.push(
+        { label: 'Copy', role: 'copy' },
+        { label: 'Select All', role: 'selectAll' },
+      );
+    }
+  }
+
+  if (template.length === 0) return;
+
+  Menu.buildFromTemplate(template).popup({
+    window: BrowserWindow.fromWebContents(webContents) || mainWindow,
+  });
+}
+
 function getDefaultWindowBounds() {
   return {
     width: 1280,
@@ -1434,10 +1617,36 @@ function createWindow() {
     return { action: 'deny' };
   });
 
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    showContextMenu(mainWindow.webContents, params);
+  });
+
+  const navigationPolicy = createNavigationPolicy(readHost);
+  const internalPages = new Set([
+    pathToFileURL(path.join(__dirname, '..', 'native-shell', 'index.html')).toString(),
+    pathToFileURL(path.join(__dirname, '..', 'native-shell', 'host-unavailable.html')).toString(),
+  ]);
+  const guardNavigation = (event, url, kind) => {
+    if (internalPages.has(url)) {
+      navigationPolicy.reset();
+      return;
+    }
+    if (navigationPolicy.decide(kind, url) === 'allow') return;
+    event.preventDefault();
+  };
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    guardNavigation(event, url, 'navigate');
+  });
+  mainWindow.webContents.on('will-redirect', (event, url, _isInPlace, isMainFrame) => {
+    if (!isMainFrame) return;
+    guardNavigation(event, url, 'redirect');
+  });
+
   mainWindow.webContents.on('did-fail-load', (_event, _errorCode, _errorDescription, validatedURL, isMainFrame) => {
     if (!isMainFrame) return;
     const host = readHost();
-    if (!host || !String(validatedURL || '').startsWith(host)) return;
+    if (!host || !isSameOrigin(host, validatedURL)) return;
     loadHostUnavailable();
   });
 
@@ -1448,7 +1657,7 @@ function createWindow() {
     if (!HOST_UNAVAILABLE_STATUS_CODES.has(details.statusCode)) return;
 
     const host = readHost();
-    if (!host || !String(details.url || '').startsWith(host)) return;
+    if (!host || !isSameOrigin(host, details.url)) return;
 
     setTimeout(() => loadHostUnavailable(), 0);
   });
@@ -1500,7 +1709,7 @@ function detectRewriteErrorPage() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const currentUrl = mainWindow.webContents.getURL();
   const host = readHost();
-  if (!host || !currentUrl.startsWith(host)) return;
+  if (!host || !isSameOrigin(host, currentUrl)) return;
 
   mainWindow.webContents.executeJavaScript('document.body ? document.body.innerText : ""', true)
     .then((text) => {
@@ -1532,7 +1741,24 @@ function scheduleStartupUpdateCheck() {
 ipcMain.handle('mailflow:getHost', () => readHost());
 
 ipcMain.handle('mailflow:saveHost', async (_event, host) => {
-  const normalized = writeHost(host);
+  const normalized = normalizeHost(host);
+  if (new URL(normalized).protocol === 'http:') {
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Use unencrypted connection', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: 'Unencrypted MailFlow connection',
+      message: 'Traffic to this MailFlow server is not encrypted.',
+      detail: 'Your session cookie and email data can be read or changed by anyone who can observe this network. Continue only on a private network you trust.',
+    });
+    if (result.response !== 0) {
+      throw new Error('The unencrypted MailFlow host was not saved.');
+    }
+  }
+
+  writeHost(normalized);
   return normalized;
 });
 
@@ -1560,6 +1786,10 @@ ipcMain.handle('mailflow:updates:install-downloaded', () => {
 
 ipcMain.handle('mailflow:updates:install-auto', () => {
   return installDownloadedUpdate();
+});
+
+ipcMain.handle('mailflow:updates:copy-install-command-and-quit', (_event, options) => {
+  return copyLinuxUpdateCommandAndQuit(options);
 });
 
 ipcMain.handle('mailflow:updates:open-download', () => {

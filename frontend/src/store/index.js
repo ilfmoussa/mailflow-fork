@@ -1,24 +1,70 @@
 import { create } from 'zustand';
 import { api } from '../utils/api.js';
+import { accountAffectsUnifiedInbox } from '../utils/unifiedInbox.js';
 import { applyTheme, applyCustomCss, getInitialTheme } from '../themes.js';
-import { applyFontSet, applyFontSize } from '../fonts.js';
+import { applyFontSet, applyFontSize, effectiveFontSet, isRetroFont, THEME_FONT } from '../fonts.js';
 import { applyLayout, normalizeLayout } from '../layouts.js';
 import { DEFAULT_AI_ACTIONS } from '../aiActions.js';
-import { removeGtdThreadFromSections, setGtdThreadReadInSections } from '../utils/gtd.js';
+import {
+  removeGtdThreadFromSections,
+  restoreGtdThreadRemoval,
+  setGtdThreadReadInSections,
+  snapshotGtdThreadRemoval,
+  appendMessagesByIdentity,
+  dedupeByIdentity,
+  missingByIdentity,
+} from '../utils/gtd.js';
+import { applyGtdRemovalGuard } from '../utils/pendingGtdRemovals.js';
 import { clampRightSidebarWidth } from '../utils/rightSidebar.js';
+import {
+  cacheFolderOrderFromPreferences,
+  mergeFolderOrder,
+  readFolderOrder,
+} from './folderOrder.js';
+import { removeThreadCacheEntry } from '../utils/threadedArchive.js';
 import i18n from '../i18n.js';
+import { createPrefSaveQueue } from '../utils/prefSaveQueue.js';
 
-// Accumulate rapid preference changes and flush at most once per second.
-let _prefFlushTimer = null;
-let _pendingPrefs = {};
+// Accumulate rapid preference changes and flush at most once per second. The queue itself
+// lives in prefSaveQueue.js so its behaviour is testable without a network or a DOM.
+const _prefQueue = createPrefSaveQueue({
+  save: (prefs) => api.savePreferences(prefs),
+  saveOnExit: (prefs) => api.savePreferencesOnExit(prefs),
+  delayMs: 1000,
+  onError: (err, keys) => {
+    // Previously `.catch(() => {})`. A preference that failed to save said nothing and then
+    // reverted on the next load, when loadPreferences overwrote localStorage with the older
+    // server value. Naming the keys makes that diagnosable instead of a mystery.
+    console.error(`Failed to save preference(s): ${keys.join(', ')}`, err?.message || err);
+  },
+});
+
 function schedulePrefSave(prefs) {
-  Object.assign(_pendingPrefs, prefs);
-  clearTimeout(_prefFlushTimer);
-  _prefFlushTimer = setTimeout(() => {
-    const toSave = _pendingPrefs;
-    _pendingPrefs = {};
-    api.savePreferences(toSave).catch(() => {});
-  }, 1000);
+  _prefQueue.schedule(prefs);
+}
+
+// Drop any queued preference flush. Called on logout / account switch: a pending debounce
+// belongs to the previous user's session, so letting it fire would either save into the new
+// user's account or hit a dead session (401). The prefs are already applied locally; only the
+// deferred network write is discarded.
+function cancelPendingPrefSave() {
+  _prefQueue.cancel();
+}
+
+// Write anything still queued before the page can go away. Without this a setting changed
+// inside the debounce window was lost outright, and because it had already been written to
+// localStorage the UI looked correct until the next load hydrated the older server value
+// back over it, so the setting appeared to revert on its own.
+//
+// pagehide plus visibilitychange rather than beforeunload: beforeunload does not fire
+// reliably on mobile, where the page is frozen or discarded instead. visibilitychange also
+// covers tab switches and app backgrounding, which simply means the write lands sooner.
+if (typeof window !== 'undefined') {
+  const flushOnExit = () => _prefQueue.flush({ exiting: true });
+  window.addEventListener('pagehide', flushOnExit);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushOnExit();
+  });
 }
 
 // GTD sections fetch coordination. A monotonic seq guards against stale
@@ -40,8 +86,34 @@ function readGtdCollapsedSections() {
 export const useStore = create((set, get) => ({
   // Auth
   user: null,
-  setUser: (user) => set({ user }),
+  setUser: (user) => {
+    // On a real identity change (login, logout, account switch) drop any queued preference
+    // flush so the previous user's debounce can't save into the new/absent session.
+    if (get().user?.id !== user?.id) cancelPendingPrefSave();
+    set(state => ({
+      user,
+      ...(state.user?.id !== user?.id ? {
+        senderFaviconsLoaded: false,
+        senderFavicons: false,
+        senderFaviconsSaving: false,
+      } : {}),
+    }));
+  },
   updateUser: (updates) => set(state => ({ user: state.user ? { ...state.user, ...updates } : state.user })),
+
+  // Plugin activation — the per-user set of activated plugin ids (users.preferences.enabledPlugins).
+  // Hydrated in loadPreferences and mutated only via setPluginActivated (the Plugins settings
+  // section). Independent of a plugin's own per-account config; a plugin's UI gates on membership
+  // here (e.g. GTD's gtdActiveForContext requires 'gtd' to be present).
+  enabledPlugins: [],
+  setPluginActivated: async (id, activated) => {
+    await api.plugins.setActivated(id, activated);
+    set(state => {
+      const next = new Set(state.enabledPlugins);
+      if (activated) next.add(id); else next.delete(id);
+      return { enabledPlugins: [...next] };
+    });
+  },
 
   // Todoist integration status (persisted across page loads via localStorage)
   todoistConnected: localStorage.getItem('mailflow_todoist_connected') === '1',
@@ -132,17 +204,18 @@ export const useStore = create((set, get) => ({
 
   // Messages
   messages: [],
-  setMessages: (messages) => set({ messages }),
+  // Dedupe by stable identity on every raw list load: the same email can arrive as two rows
+  // (same message delivered to two unified accounts, or a received copy + its Sent twin) and
+  // must render once, matching isSelectedRow's identity model (#378). appendMessages/restore
+  // dedupe on their own paths; this covers the initial/refresh/page loads that replace wholesale.
+  setMessages: (messages) => set({ messages: dedupeByIdentity(messages) }),
   appendMessages: (newMessages) => set(state => {
-    // Deduplicate by id: if the same message already exists in state, keep the
-    // existing copy (which may carry optimistic local-only fields the network
-    // refresh just lost, like unread_count). Without this, bulk operations
-    // (Mark as Spam, moveTo, scheduleDelete...) followed by Undo + a network
-    // refresh can briefly produce visible "clones" of the same message.
-    const existing = new Set(state.messages.map(m => m.id));
-    const additions = newMessages.filter(m => m && !existing.has(m.id));
-    if (additions.length === 0) return {};
-    return { messages: [...state.messages, ...additions] };
+    // Merge by stable identity (Message-ID when present, else id): a same-id row is dropped so the
+    // existing copy keeps any optimistic local-only fields a refresh lost (unread_count, etc.),
+    // while a reindexed message (same Message-ID, new id after a purge+reinsert) replaces its stale
+    // row in place instead of appearing as a duplicate. See appendMessagesByIdentity.
+    const messages = appendMessagesByIdentity(state.messages, newMessages);
+    return messages === state.messages ? {} : { messages };
   }),
   updateMessage: (id, updates) => set(state => {
     const apply = (m) => m.id === id ? { ...m, ...updates } : m;
@@ -186,15 +259,13 @@ export const useStore = create((set, get) => ({
   restoreMessages: (msgs) => set(state => {
     const list = Array.isArray(msgs) ? msgs : [msgs];
     const sort = arr => [...arr].sort((a, b) => new Date(b.date) - new Date(a.date));
-    // Deduplicate against both the main list and searchResults: if the message
-    // is already present (e.g. user clicked Undo after the messages had already
-    // been restored by a network refresh), skip it. The local copy carries the
-    // freshest optimistic state, so we prefer it over the server view.
-    const inMessages = new Set(state.messages.map(m => m.id));
-    const missing = list.filter(m => m && !inMessages.has(m.id));
+    // Deduplicate against both the main list and searchResults by stable identity (Message-ID when
+    // present, else id): if the message is already present — including re-added by a network
+    // refresh under a regenerated id (matched via Message-ID) — skip it. The local copy carries the
+    // freshest optimistic state, so we prefer it over the server view. See missingByIdentity.
+    const missing = missingByIdentity(state.messages, list);
     if (missing.length === 0 && !state.searchQuery.trim()) return {};
-    const inSearch = new Set(state.searchResults.map(m => m.id));
-    const missingFromSearch = list.filter(m => m && !inSearch.has(m.id));
+    const missingFromSearch = missingByIdentity(state.searchResults, list);
     return {
       messages: missing.length ? sort([...state.messages, ...missing]) : state.messages,
       searchResults: state.searchQuery.trim() && missingFromSearch.length
@@ -220,13 +291,18 @@ export const useStore = create((set, get) => ({
   decrementUnread: (accountId, count = 1) => set(state => {
     const byAccount = { ...state.unreadCounts.byAccount };
     byAccount[accountId] = Math.max(0, (byAccount[accountId] || 0) - count);
-    const total = Math.max(0, state.unreadCounts.total - count);
+    const total = accountAffectsUnifiedInbox(state.accounts, accountId)
+      ? Math.max(0, state.unreadCounts.total - count)
+      : state.unreadCounts.total;
     return { unreadCounts: { total, byAccount } };
   }),
   incrementUnread: (accountId, count = 1) => set(state => {
     const byAccount = { ...state.unreadCounts.byAccount };
     byAccount[accountId] = (byAccount[accountId] || 0) + count;
-    return { unreadCounts: { total: state.unreadCounts.total + count, byAccount } };
+    const total = accountAffectsUnifiedInbox(state.accounts, accountId)
+      ? state.unreadCounts.total + count
+      : state.unreadCounts.total;
+    return { unreadCounts: { total, byAccount } };
   }),
 
   // Folders
@@ -339,6 +415,60 @@ export const useStore = create((set, get) => ({
   composeData: null,
   openCompose: (data = null) => set({ composing: true, composeData: data }),
   closeCompose: () => set({ composing: false, composeData: null }),
+
+  // Detached message windows (#219): floating, draggable/resizable in-app windows
+  // that each show one message via a MessagePane instance. Desktop-only; mounted by
+  // WindowLayer. `_winSeq` is a monotonic counter serving as both a unique id source
+  // and the z-order stamp (higher = on top / more recently focused).
+  messageWindows: [],
+  _winSeq: 0,
+  openMessageWindow: (messageId) => set(state => {
+    const seq = state._winSeq + 1;
+    // Re-opening a message that already has a window focuses + un-minimizes it
+    // rather than spawning a duplicate.
+    if (state.messageWindows.some(w => w.messageId === messageId)) {
+      return {
+        _winSeq: seq,
+        messageWindows: state.messageWindows.map(w =>
+          w.messageId === messageId ? { ...w, minimized: false, z: seq } : w),
+      };
+    }
+    const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+    const w = Math.min(660, Math.max(360, vw - 80));
+    const h = Math.min(740, Math.max(280, vh - 80));
+    // Cascade each new window down-right so they don't stack exactly on top.
+    const cascade = (state.messageWindows.length % 6) * 28;
+    const x = Math.max(12, Math.min(vw - w - 12, Math.round((vw - w) / 2) - 80 + cascade));
+    const y = Math.max(12, Math.min(vh - h - 12, 72 + cascade));
+    return {
+      _winSeq: seq,
+      messageWindows: [...state.messageWindows, { winId: `mw-${seq}`, messageId, x, y, w, h, z: seq, minimized: false }],
+    };
+  }),
+  closeMessageWindow: (winId) => set(state => ({
+    messageWindows: state.messageWindows.filter(w => w.winId !== winId),
+  })),
+  focusMessageWindow: (winId) => set(state => {
+    const seq = state._winSeq + 1;
+    return {
+      _winSeq: seq,
+      messageWindows: state.messageWindows.map(w => w.winId === winId ? { ...w, z: seq } : w),
+    };
+  }),
+  setMessageWindowMinimized: (winId, minimized) => set(state => {
+    const seq = state._winSeq + 1;
+    return {
+      _winSeq: seq,
+      // Restoring (minimized=false) also brings the window to the front.
+      messageWindows: state.messageWindows.map(w =>
+        w.winId === winId ? { ...w, minimized, z: minimized ? w.z : seq } : w),
+    };
+  }),
+  updateMessageWindowRect: (winId, rect) => set(state => ({
+    messageWindows: state.messageWindows.map(w => w.winId === winId ? { ...w, ...rect } : w),
+  })),
+  closeAllMessageWindows: () => set({ messageWindows: [] }),
   searchQuery: '',
   setSearchQuery: (q) => set({ searchQuery: q }),
   isSearching: false,
@@ -418,6 +548,18 @@ export const useStore = create((set, get) => ({
     schedulePrefSave({ plaintextEmail: val });
   },
 
+  // Default sender for composes with no account context, i.e. the unified inbox (#417).
+  // Holds a From selector value ('account:<id>' or 'alias:<aliasId>:<accountId>') so an
+  // alias can be the default too. '' means "no preference", which keeps the previous
+  // last-used-account behaviour. Validated at use, since accounts and aliases outlive it.
+  defaultSender: localStorage.getItem('mailflow_default_sender') || '',
+  setDefaultSender: (val) => {
+    const clean = typeof val === 'string' ? val : '';
+    localStorage.setItem('mailflow_default_sender', clean);
+    set({ defaultSender: clean });
+    schedulePrefSave({ defaultSender: clean });
+  },
+
   // Message list quick actions
   hoverQuickActions: localStorage.getItem('mailflow_hover_quick_actions') !== 'false',
   setHoverQuickActions: (val) => {
@@ -442,6 +584,14 @@ export const useStore = create((set, get) => ({
     localStorage.setItem('mailflow_gravatar_avatars', String(val));
     set({ gravatarAvatars: val });
     schedulePrefSave({ gravatarAvatars: val });
+  },
+
+  // Show message preview snippets in the message list (on by default).
+  showMessagePreviews: localStorage.getItem('mailflow_show_message_previews') !== 'false',
+  setShowMessagePreviews: (val) => {
+    localStorage.setItem('mailflow_show_message_previews', String(val));
+    set({ showMessagePreviews: val });
+    schedulePrefSave({ showMessagePreviews: val });
   },
 
   replyDefault: localStorage.getItem('mailflow_reply_default') || 'reply',
@@ -472,6 +622,9 @@ export const useStore = create((set, get) => ({
   setThreadMessages: (threadId, msgs) => set(state => ({
     threadMessages: { ...state.threadMessages, [threadId]: msgs },
   })),
+  clearThreadMessages: (threadId) => set(state => ({
+    threadMessages: removeThreadCacheEntry(state.threadMessages, threadId),
+  })),
   loadingThread: null,
   setLoadingThread: (id) => set({ loadingThread: id }),
 
@@ -481,6 +634,15 @@ export const useStore = create((set, get) => ({
     localStorage.setItem('mailflow_theme', theme);
     set({ theme });
     applyTheme(theme); // keep CSS vars + favicon in sync
+    // If a retro font was left as the saved choice, a non-retro theme must not keep it —
+    // normalise the stored choice so it can't "stick" (and the font picker stays honest).
+    if (!THEME_FONT[theme] && isRetroFont(get().fontSet)) {
+      localStorage.setItem('mailflow_font', 'default');
+      set({ fontSet: 'default' });
+      schedulePrefSave({ font: 'default' });
+    }
+    // Retro themes bring their own font; other themes fall back to the saved choice.
+    applyFontSet(effectiveFontSet(theme, get().fontSet));
     schedulePrefSave({ theme });
   },
 
@@ -489,7 +651,8 @@ export const useStore = create((set, get) => ({
   setFontSet: (fontSet) => {
     localStorage.setItem('mailflow_font', fontSet);
     set({ fontSet });
-    applyFontSet(fontSet);
+    // A retro theme's paired font still wins over an explicit pick while it's active.
+    applyFontSet(effectiveFontSet(get().theme, fontSet));
     schedulePrefSave({ font: fontSet });
   },
 
@@ -572,7 +735,7 @@ export const useStore = create((set, get) => ({
     try {
       const data = await api.getGtdSections({ accountId, limit: 50 });
       if (seq !== _gtdSectionsSeq) return; // superseded by a newer fetch
-      set({ gtdSections: data.sections || {} });
+      set({ gtdSections: applyGtdRemovalGuard(data.sections || {}) });
     } catch {
       // Best-effort; scheduleGtdSectionsFetch/the next context change will retry.
     }
@@ -589,8 +752,17 @@ export const useStore = create((set, get) => ({
   // are the backend section keys whose labels were removed (todo/watch/delegated/…).
   // Delegates to a pure helper (unit-tested in gtd.test.js) that also keeps the deduped
   // Waiting rollup in step so the Waiting badge is correct instantly.
-  removeGtdThread: (identity, states) => set(state => {
-    const next = removeGtdThreadFromSections(state.gtdSections, identity, states);
+  removeGtdThread: (identity, states) => {
+    let snapshot = null;
+    set(state => {
+      snapshot = snapshotGtdThreadRemoval(state.gtdSections, identity, states);
+      const next = removeGtdThreadFromSections(state.gtdSections, identity, states);
+      return next === state.gtdSections ? {} : { gtdSections: next };
+    });
+    return snapshot;
+  },
+  restoreGtdThread: (snapshot) => set(state => {
+    const next = restoreGtdThreadRemoval(state.gtdSections, snapshot);
     return next === state.gtdSections ? {} : { gtdSections: next };
   }),
   // Optimistically flip a section thread's read flag so a rail row's bold/normal styling
@@ -656,6 +828,35 @@ export const useStore = create((set, get) => ({
   // Image privacy
   blockRemoteImages: true,
   imageWhitelist: { addresses: [], domains: [] },
+  senderFaviconsLoaded: false,
+  senderFavicons: false,
+  senderFaviconsSaving: false,
+  // Monotonic counter bumped on every toggle. loadPreferences captures it before
+  // its GET so a stale hydration response can't clobber a toggle the user made
+  // while the fetch was in flight. Never reset — the user-id guard covers account
+  // switches, and monotonicity avoids ABA.
+  senderFaviconsEpoch: 0,
+  setSenderFavicons: async (enabled) => {
+    if (get().senderFaviconsSaving) return;
+    const userId = get().user?.id;
+    set(state => ({ senderFaviconsSaving: true, senderFaviconsEpoch: state.senderFaviconsEpoch + 1 }));
+    if (!enabled) {
+      set({ senderFavicons: false });
+      try { await api.savePreferences({ senderFavicons: false }); }
+      finally {
+        if (get().user?.id === userId) set({ senderFaviconsSaving: false });
+      }
+      return;
+    }
+    try {
+      await api.savePreferences({ senderFavicons: true });
+      if (get().user?.id === userId) {
+        set({ senderFaviconsLoaded: true, senderFavicons: true });
+      }
+    } finally {
+      if (get().user?.id === userId) set({ senderFaviconsSaving: false });
+    }
+  },
   setBlockRemoteImages: (val) => {
     set({ blockRemoteImages: val });
     return api.savePreferences({ blockRemoteImages: val });
@@ -705,6 +906,14 @@ export const useStore = create((set, get) => ({
   setHiddenFolders: (hf) => {
     set({ hiddenFolders: hf });
     return api.savePreferences({ hiddenFolders: hf }).catch(() => {});
+  },
+
+  // Custom per-account folder display order — { [accountId]: [path, ...] }
+  folderOrder: readFolderOrder(),
+  setFolderOrder: (accountId, paths) => {
+    const next = mergeFolderOrder(get().folderOrder, accountId, paths);
+    set({ folderOrder: next });
+    schedulePrefSave({ folderOrder: next });
   },
 
   // Sidebar tree state — persisted so the tree looks the same after reload/re-login
@@ -786,8 +995,14 @@ export const useStore = create((set, get) => ({
   // Fetch server preferences and apply them — call after any successful login.
   // Sets localStorage so subsequent page loads apply the right values instantly.
   loadPreferences: async () => {
+    const userId = get().user?.id;
+    const faviconEpoch = get().senderFaviconsEpoch;
     try {
       const prefs = await api.getPreferences();
+      if (get().user?.id !== userId) return;
+      // Per-user plugin activation. Absent = nothing activated (new users start with GTD off);
+      // existing GTD users were grandfathered into ['gtd'] by migration 0042.
+      set({ enabledPlugins: Array.isArray(prefs.enabledPlugins) ? prefs.enabledPlugins : [] });
       if (prefs.theme) {
         localStorage.setItem('mailflow_theme', prefs.theme);
         set({ theme: prefs.theme });
@@ -796,8 +1011,10 @@ export const useStore = create((set, get) => ({
       if (prefs.font) {
         localStorage.setItem('mailflow_font', prefs.font);
         set({ fontSet: prefs.font });
-        applyFontSet(prefs.font);
       }
+      // Apply the effective font once theme + font are both known, so a retro theme's
+      // paired font overrides the saved font on load.
+      applyFontSet(effectiveFontSet(get().theme, get().fontSet));
       if (prefs.fontSize) {
         const n = parseInt(prefs.fontSize) || 100;
         localStorage.setItem('mailflow_font_size', String(n));
@@ -856,6 +1073,13 @@ export const useStore = create((set, get) => ({
         set({ autoLockMinutes: [0, 1, 5, 15, 30].includes(n) ? n : 0 });
       }
       if (prefs.imageWhitelist) set({ imageWhitelist: prefs.imageWhitelist });
+      // Hydration is done, but if the user toggled while this GET was in flight
+      // (epoch bumped), the toggle owns senderFavicons — only mark it loaded.
+      if (get().senderFaviconsEpoch === faviconEpoch) {
+        set({ senderFaviconsLoaded: true, senderFavicons: prefs.senderFavicons === true });
+      } else {
+        set({ senderFaviconsLoaded: true });
+      }
       if (prefs.shortcuts) set({ shortcuts: prefs.shortcuts });
       if (Array.isArray(prefs.aiActions)) {
         set({ aiActions: prefs.aiActions });
@@ -866,6 +1090,7 @@ export const useStore = create((set, get) => ({
         api.savePreferences({ aiActions: DEFAULT_AI_ACTIONS }).catch(() => {});
       }
       if (prefs.hiddenFolders) set({ hiddenFolders: prefs.hiddenFolders });
+      set({ folderOrder: cacheFolderOrderFromPreferences(prefs) });
       if (prefs.expandedAccounts && typeof prefs.expandedAccounts === 'object' && !Array.isArray(prefs.expandedAccounts)) {
         localStorage.setItem('mailflow_expanded_accounts', JSON.stringify(prefs.expandedAccounts));
         set({ expandedAccounts: prefs.expandedAccounts });
@@ -895,6 +1120,10 @@ export const useStore = create((set, get) => ({
         localStorage.setItem('mailflow_plaintext_email', String(prefs.plaintextEmail));
         set({ plaintextEmail: prefs.plaintextEmail });
       }
+      if (typeof prefs.defaultSender === 'string') {
+        localStorage.setItem('mailflow_default_sender', prefs.defaultSender);
+        set({ defaultSender: prefs.defaultSender });
+      }
       if (typeof prefs.hoverQuickActions === 'boolean') {
         localStorage.setItem('mailflow_hover_quick_actions', String(prefs.hoverQuickActions));
         set({ hoverQuickActions: prefs.hoverQuickActions });
@@ -906,6 +1135,10 @@ export const useStore = create((set, get) => ({
       if (typeof prefs.gravatarAvatars === 'boolean') {
         localStorage.setItem('mailflow_gravatar_avatars', String(prefs.gravatarAvatars));
         set({ gravatarAvatars: prefs.gravatarAvatars });
+      }
+      if (typeof prefs.showMessagePreviews === 'boolean') {
+        localStorage.setItem('mailflow_show_message_previews', String(prefs.showMessagePreviews));
+        set({ showMessagePreviews: prefs.showMessagePreviews });
       }
       if (prefs.replyDefault === 'reply' || prefs.replyDefault === 'replyAll') {
         localStorage.setItem('mailflow_reply_default', prefs.replyDefault);

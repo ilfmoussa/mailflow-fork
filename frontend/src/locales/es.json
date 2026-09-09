@@ -7,6 +7,7 @@
     "add": "Añadir",
     "remove": "Quitar",
     "copy": "Copiar",
+    "copyFailed": "No se pudo copiar. Selecciona el texto y cópialo manualmente.",
     "back": "Volver",
     "undo": "Deshacer",
     "view": "Ver",
@@ -179,9 +180,19 @@
     }
   },
   "message": {
+    "find": {
+      "title": "Buscar",
+      "close": "Cerrar búsqueda",
+      "label": "Buscar:",
+      "matchCase": "Distinguir mayúsculas",
+      "previous": "Anterior",
+      "next": "Siguiente",
+      "closeButton": "Cerrar"
+    },
     "selectToRead": "Selecciona un mensaje para leer",
     "noSubject": "(sin asunto)",
     "to": "Para:",
+    "via": "vía",
     "attachment_one": "{{count}} adjunto",
     "attachment_other": "{{count}} adjuntos",
     "loadingError": "No se puede cargar el cuerpo del mensaje",
@@ -399,11 +410,15 @@
     "renameFailed": "Error al renombrar",
     "deleteFailed": "Error al eliminar",
     "emptyFailed": "Error al vaciar",
+    "emptying": "Vaciando «{{name}}»…",
+    "emptied": "Carpeta vaciada",
     "backToAccounts": "Volver a cuentas",
     "updateAvailable": "Actualización disponible: v{{version}}"
   },
   "contextMenu": {
+    "find": "Buscar",
     "open": "Abrir",
+    "openInNewWindow": "Abrir en ventana nueva",
     "markRead": "Marcar como leído",
     "markUnread": "Marcar como no leído",
     "star": "Destacar mensaje",
@@ -428,6 +443,7 @@
     "markAsHam": "Marcar como no Spam",
     "copySubject": "Copiar asunto",
     "copySender": "Copiar dirección del remitente",
+    "copyLink": "Copiar enlace",
     "viewHeaders": "Ver encabezados completos",
     "delete": "Eliminar",
     "headers": {
@@ -551,6 +567,9 @@
         "label": "Marcar Delegado",
         "description": "Clasificar el mensaje seleccionado como Delegado"
       },
+      "gtdUndo": {
+        "description": "Deshacer la última clasificación GTD"
+      },
       "toggleRightSidebar": {
         "label": "Alternar la barra lateral derecha",
         "description": "Ocultar o mostrar la barra lateral derecha"
@@ -589,9 +608,30 @@
     "errorProcess": "No se pudo procesar la imagen."
   },
   "admin": {
+    "cleanup": {
+      "title": "Limpieza del buzón",
+      "intro": "Encuentra el correo masivo que satura tu bandeja de entrada y despéjalo. Elige si archivarlo (se conserva y se puede buscar) o moverlo a la papelera (recuperable hasta que la vacíes).",
+      "account": "Cuenta",
+      "summary": "{{bulk}} de {{total}} mensajes de la bandeja son correo masivo ({{pct}}%).",
+      "tier1Title": "Principales remitentes masivos",
+      "tier1Desc": "Estos son los remitentes de boletines y marketing con mayor volumen en tu bandeja de entrada. Actuar sobre uno procesa todo el correo de ese remitente en la bandeja de entrada con la acción elegida.",
+      "noneFound": "No se encontraron remitentes masivos.",
+      "moveToTrash": "Mover a la Papelera",
+      "confirm": "¿Mover a la Papelera los {{count}} mensajes de {{sender}}? Se pueden recuperar de la Papelera hasta que la vacíes.",
+      "tier2Title": "Términos promocionales comunes",
+      "tier2Desc": "Busca estos términos para revisar y eliminar el resto tú mismo. Abarcan muchos remitentes, así que revisa los resultados antes de eliminar.",
+      "tier3Title": "Limpiar el resto",
+      "tier3Desc": "Para lo demás, busca por remitente o palabra clave, selecciona todo y elimina. Al eliminar, el correo va primero a la Papelera, así que puedes revisar antes de vaciarla.",
+      "action": "Acción de limpieza",
+      "actionArchive": "Archivar (recomendado)",
+      "archive": "Archivar",
+      "confirmArchive": "¿Archivar los {{count}} mensajes de {{sender}} en la bandeja de entrada? Permanecerán en tu carpeta de Archivo y se podrán seguir buscando.",
+      "noArchiveFolder": "Esta cuenta no tiene carpeta de archivo, así que solo está disponible Mover a la papelera."
+    },
     "title": "Ajustes",
     "close": "Cerrar",
     "tabs": {
+      "cleanup": "Limpieza",
       "accounts": "Cuentas",
       "rules": "Reglas",
       "appearance": "Apariencia",
@@ -611,7 +651,8 @@
       "groupAccountMail": "Cuenta y correo",
       "groupDisplay": "Visualización",
       "groupSecurityIntegrations": "Seguridad e integraciones",
-      "groupAdmin": "Administración"
+      "groupAdmin": "Administración",
+      "plugins": "Complementos"
     },
     "rules": {
       "title": "Reglas de bandeja de entrada",
@@ -650,6 +691,8 @@
       "actionArchive": "Archivar",
       "actionDelete": "Mover a la papelera",
       "actionMove": "Mover a carpeta",
+      "actionForward": "Reenviar a",
+      "actionForwardPlaceholder": "destinatario@example.com",
       "actionMovePlaceholder": "Nombre de la carpeta",
       "stopProcessing": "Detener el procesamiento de reglas posteriores si esta coincide",
       "stopProcessingHint": "Si esta regla coincide, las reglas posteriores no se ejecutarán para el mismo mensaje.",
@@ -657,6 +700,7 @@
       "saving": "Guardando…",
       "errorRequired": "Se requiere nombre, al menos una condición y una acción.",
       "errorMoveFolder": "Ingresa una carpeta de destino para la acción Mover.",
+      "errorForwardEmail": "Introduce una dirección de reenvío válida.",
       "errorSave": "No se pudo guardar la regla.",
       "runButton": "Aplicar reglas a la bandeja de entrada",
       "running": "Ejecutando…",
@@ -710,6 +754,10 @@
       "smtpHost": "Servidor SMTP",
       "smtpHostPh": "smtp.gmail.com",
       "smtpPort": "Puerto",
+      "smtpAuthNote": "Solo es necesario si tu servidor de salida (SMTP) usa un usuario y una contraseña distintos a los de arriba. Déjalo en blanco para reutilizarlos.",
+      "smtpAuthUser": "Usuario SMTP",
+      "smtpAuthUserPh": "Igual que el usuario de arriba",
+      "smtpAuthPass": "Contraseña SMTP",
       "signatureSection": "Firma",
       "saveChanges": "Guardar cambios",
       "addAccount": "Añadir cuenta",
@@ -730,6 +778,9 @@
       "syncFoldersError": "Error al sincronizar carpetas",
       "senderNamePh": "p. ej. Alice Smith",
       "senderName": "Nombre del remitente",
+      "unifiedInboxSection": "Bandeja de entrada unificada",
+      "unifiedInboxEnabled": "Incluir en la bandeja unificada",
+      "unifiedInboxEnabledDesc": "Mostrar los mensajes de esta cuenta en Todas las bandejas, la búsqueda unificada y los recuentos de categorías.",
       "categorizationSection": "Categorización de correo",
       "categorizationEnabled": "Activar categorización del buzón",
       "categorizationEnabledDesc": "Clasifica los correos entrantes en pestañas de categorías. Desactivado por defecto.",
@@ -796,6 +847,9 @@
     },
     "messageList": {
       "title": "Lista de mensajes",
+      "senderFavicons": "Favicons de remitentes",
+      "senderFaviconsDesc": "Mostrar iconos de sitios web para los remitentes sin foto de contacto. Solo se envía a Twenty Icons el dominio del remitente, nunca su dirección de correo completa.",
+      "senderFaviconsSaveError": "No se pudo guardar el ajuste de favicons de remitentes.",
       "scrollingMode": "Modo de desplazamiento",
       "infiniteScroll": "Desplazamiento infinito",
       "infiniteScrollDesc": "Se carga automáticamente al desplazarte hacia abajo",
@@ -839,6 +893,11 @@
       "hoverQuickActionsOffDesc": "Mantener las acciones rápidas ocultas hasta usar el menú contextual o atajos.",
       "hoverQuickActionsOn": "Activado",
       "hoverQuickActionsOnDesc": "Mostrar iconos de acción rápida en las filas de mensajes cuando el cursor esté sobre ellas.",
+      "showMessagePreviews": "Previsualización de mensajes",
+      "previewOff": "Desactivado",
+      "previewOffDesc": "Ocultar la línea de vista previa debajo de cada asunto.",
+      "previewOn": "Activado",
+      "previewOnDesc": "Mostrar la línea de vista previa debajo de cada asunto.",
       "mobileAvatarsMode": "Avatares del remitente (móvil)",
       "mobileAvatarsOff": "Desactivado",
       "mobileAvatarsOffDesc": "Sin avatar: máximo espacio para remitente y asunto.",
@@ -854,6 +913,9 @@
       "defaultReplyAction": "Acción de respuesta predeterminada",
       "defaultReply": "Responder",
       "defaultReplyAllDesc": "El botón Responder envía a todos los destinatarios",
+      "defaultSender": "Remitente predeterminado",
+      "defaultSenderDesc": "Desde qué dirección se envían los mensajes nuevos cuando redactas fuera de una cuenta concreta, como en la bandeja unificada. Las respuestas siempre usan la cuenta que recibió el mensaje.",
+      "defaultSenderLastUsed": "Última cuenta utilizada",
       "markReadBehavior": "Marcar como leído",
       "markReadImmediate": "Inmediatamente",
       "markReadImmediateDesc": "Marcar los correos como leídos en cuanto los abres.",
@@ -962,7 +1024,7 @@
       "mailPolicyTitle": "Política de conexión del servidor de correo",
       "mailPolicyDesc": "Controla qué tipos de conexión pueden configurar los usuarios. Deshabilitar para implementaciones con acceso a Internet.",
       "allowPrivateHosts": "Permitir hosts privados / locales",
-      "allowPrivateHostsDesc": "Permite conectarse a servidores IMAP y SMTP en direcciones privadas o locales (p. ej. 127.0.0.1, 192.168.x.x). Necesario para protonmail-bridge y puentes de correo locales similares.",
+      "allowPrivateHostsDesc": "Permite conectarse a servidores de correo IMAP/SMTP, servidores CardDAV y proveedores de IA en direcciones privadas o locales (p. ej. 127.0.0.1, 192.168.x.x). Necesario para protonmail-bridge, un servidor CardDAV/Nextcloud autoalojado o un modelo de IA local.",
       "allowInsecureTls": "Permitir TLS no seguro",
       "allowInsecureTlsDesc": "Permite a los usuarios desactivar la verificación del certificado TLS por cuenta. Necesario para servidores con certificados autofirmados.",
       "allowNonstandardPorts": "Permitir puertos no estándar",
@@ -1059,13 +1121,40 @@
       "featureCompose": "Asistente de redacción (borradores y mejoras)",
       "featureSummarize": "Resumen de correos",
       "saved": "Configuración de IA guardada.",
-      "removed": "Configuración de IA eliminada.",
       "testOk": "Conectado correctamente.",
       "testFail": "Conexión fallida",
       "test": "Probar conexión",
       "testing": "Probando…",
       "notConfigured": "Ningún proveedor de IA configurado aún.",
-      "remove": "Eliminar configuración"
+      "connectionMethod": "Método de conexión",
+      "connectionMethodPlaceholder": "Elige un método de conexión",
+      "connectionMethodApi": "Usar una clave de API",
+      "connectionMethodAccount": "Usar una suscripción",
+      "subscriptionProvider": "Proveedor de suscripción",
+      "subscriptionProviderChatgpt": "ChatGPT Plus/Pro (Codex Subscription)",
+      "chatgptModel": "Modelo de ChatGPT",
+      "chatgptModelPh": "gpt-5.6-luna",
+      "chatgptModelDocs": "Ver modelos disponibles",
+      "connectionStatus": "Conexión de ChatGPT",
+      "connectedAs": "Conectado como {{account}}",
+      "statusConnected": "Conectado",
+      "statusDisconnected": "Sin conexión",
+      "statusPending": "Esperando autorización",
+      "statusReconnect": "Es necesario volver a conectar",
+      "statusExpired": "La autorización caducó",
+      "statusCancelled": "Autorización cancelada",
+      "connect": "Conectar ChatGPT",
+      "connecting": "Iniciando…",
+      "reconnect": "Volver a conectar",
+      "disconnect": "Desconectar",
+      "disconnecting": "Desconectando…",
+      "cancelling": "Cancelando…",
+      "deviceInstructions": "Abra la página de autorización e introduzca este código de un solo uso.",
+      "copyCode": "Copiar código",
+      "copied": "Copiado",
+      "copyFailed": "No se pudo copiar el código.",
+      "openAuthorization": "Abrir página de autorización",
+      "deviceExpires": "El código caduca a las {{time}}."
     },
     "aiActions": {
       "description": "Crea tus propias acciones de IA. Aparecen en el menú de IA al leer un mensaje, junto a Resumir. El prompt de cada acción se aplica al contenido del mensaje.",
@@ -1203,12 +1292,16 @@
       "errorSecretRequired": "El secreto de cliente es obligatorio.",
       "allowInsecure": "Permitir conexiones locales / autofirmadas",
       "allowInsecureDesc": "Omite la validación del host y las verificaciones de certificados TLS. Usar solo para proveedores de solo LAN (p. ej., pocketid.internal). No recomendado para despliegues expuestos a internet.",
+      "rpLogout": "Cierre de sesión SSO (RP-initiated)",
+      "rpLogoutDesc": "Al cerrar sesión, también finaliza la sesión en este proveedor redirigiendo a su end-session endpoint, no solo la cookie de MailFlow. Requiere que el proveedor exponga un end_session_endpoint y que la URL de inicio de sesión de MailFlow (…/login) esté registrada como post-logout redirect URI.",
       "adminGroupClaim": "Claim de grupo de administrador",
       "adminGroupClaimPh": "groups",
       "adminGroupClaimDesc": "Nombre del claim JWT que contiene los grupos del usuario (p. ej., groups). Dejar en blanco para desactivar la asignación de administrador basada en grupos.",
       "adminGroupValue": "Valor del grupo de administrador",
       "adminGroupValuePh": "mailflow-admins",
       "adminGroupValueDesc": "El nombre del grupo que otorga acceso de administrador. Los usuarios de este grupo se convierten en administradores en cada inicio de sesión SSO; los usuarios que no están en este grupo pierden el acceso de administrador.",
+      "loginMatchClaim": "Asociar cuentas existentes por",
+      "loginMatchClaimDesc": "Reclamación (claim) de OIDC que se compara con el nombre de usuario de cada cuenta de MailFlow al vincular por primera vez un inicio de sesión SSO con una cuenta existente (modo de aprovisionamiento «solo iniciar sesión en cuentas existentes»). El valor predeterminado es email. Usa preferred_username, upn, etc. para proveedores de identidad cuyos nombres de usuario no son direcciones de correo, solo si tu proveedor garantiza que esa reclamación es única y no editable por el usuario.",
       "passwordLoginDisableMsg": "Los usuarios solo podrán iniciar sesión mediante SSO. Si tu proveedor SSO deja de estar disponible, se necesitará acceso directo a la base de datos para volver a habilitar el inicio de sesión con contraseña.",
       "passwordLoginDisableTitle": "¿Desactivar inicio de sesión con contraseña?",
       "passwordLoginDisabled": "El inicio de sesión con contraseña está desactivado",
@@ -1349,6 +1442,15 @@
       "autoLockNeedsPin": "Configura un PIN para activar el bloqueo automático",
       "autoLockOff": "Desactivado",
       "autoLockMin": "{{n}} min"
+    },
+    "plugins": {
+      "title": "Complementos",
+      "description": "Activa o desactiva funciones opcionales para tu cuenta. Al activar un complemento se añaden sus propios ajustes e interfaz.",
+      "activated": "Activado",
+      "deactivated": "No activado",
+      "empty": "No hay complementos disponibles en esta versión.",
+      "error": "No se pudo actualizar el complemento. Inténtalo de nuevo.",
+      "configureIn": "Configura las opciones en {{location}}"
     }
   },
   "blockList": {
@@ -1406,7 +1508,6 @@
     "carddavBadge": "Sincronizado desde CardDAV"
   },
   "todoist": {
-    "betaLabel": "Beta",
     "title": "Crear tarea en Todoist",
     "taskTitle": "Título de la tarea",
     "taskTitlePh": "¿Qué hay que hacer?",
@@ -1445,6 +1546,7 @@
     "removeFrom": "Quitar de {{state}}",
     "classified": "Etiqueta aplicada",
     "classifyFailed": "No se pudo aplicar la etiqueta",
+    "undoFailed": "No se pudo deshacer la etiqueta",
     "removed": "Etiqueta eliminada",
     "removeFailed": "No se pudo quitar la etiqueta",
     "done": "Marcar como hecho",
@@ -1457,5 +1559,22 @@
       "someday": "Algún día",
       "reference": "Referencia"
     }
+  },
+  "window": {
+    "minimize": "Minimizar",
+    "close": "Cerrar"
+  },
+  "diagnostics": {
+    "section": "Diagnóstico",
+    "blurb": "Un informe depurado que puedes compartir para ayudar a diagnosticar. No contiene direcciones de correo, nombres, contenido de mensajes ni datos secretos.",
+    "generateReport": "Generar informe de diagnóstico",
+    "title": "Informe de diagnóstico",
+    "includes": "Incluye: versiones de la aplicación, tu entorno, recuentos por cuenta y carpeta, categorías de errores de sincronización y estado del servidor. Los ID de cuenta y los nombres de carpetas personalizadas se reemplazan por hashes de un solo uso.",
+    "excludes": "Excluye: direcciones de correo, nombres, asuntos, contenido de mensajes, contraseñas y claves o tokens de API.",
+    "download": "Descargar JSON",
+    "copied": "Informe copiado",
+    "copyFailed": "Error al copiar",
+    "generating": "Generando informe…",
+    "error": "No se pudo generar el informe."
   }
 }
