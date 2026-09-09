@@ -1407,8 +1407,8 @@ export default function Sidebar() {
                           padding: `6px 10px 6px ${indent}px`, borderRadius: 7,
                           cursor: isRenaming ? 'default' : 'pointer',
                           background: (msgDragTarget === `${account.id}:${folder.path}`) ? 'var(--accent-dim)' : isFolderSelected ? folderBgSelected : folderBg,
-                          // Fork: fine séparation entre dossiers (laisse voir le fond de la sidebar)
-                          borderBottom: '1px solid var(--bg-primary)',
+                          // Fork: fine séparation visible entre dossiers
+                          borderBottom: '1px solid var(--border-subtle)',
                           transition: 'background 0.1s',
                           boxShadow: dropPosition === 'before'
                             ? 'inset 0 2px var(--accent)'
