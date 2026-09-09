@@ -1176,6 +1176,16 @@ export default function Sidebar() {
           const selectInbox = () => setSelectedAccount(account.id, 'INBOX');
           const rowLabel = collapsedTooltip(account.email_address, sidebarCollapsed);
 
+          // Fork: la bande du compte et le fond de ses dossiers sont teintés à la
+          // couleur du compte (color-mix sur le fond, comme dans MessageList), au lieu
+          // d'une simple pastille. En-tête plus saturé, dossiers plus clairs.
+          const accColor = account.color || 'var(--accent)';
+          const headerBg        = `color-mix(in srgb, ${accColor} 20%, var(--bg-primary))`;
+          const headerBgHover   = `color-mix(in srgb, ${accColor} 30%, var(--bg-primary))`;
+          const folderBg        = `color-mix(in srgb, ${accColor} 8%, var(--bg-primary))`;
+          const folderBgHover   = `color-mix(in srgb, ${accColor} 16%, var(--bg-primary))`;
+          const folderBgSelected = `color-mix(in srgb, ${accColor} 26%, var(--bg-primary))`;
+
           return (
             <div key={account.id}>
               {/* Only the collapsed row may carry a button role: expanded, it holds
@@ -1186,17 +1196,20 @@ export default function Sidebar() {
                   padding: sidebarCollapsed ? '8px' : '7px 10px',
                   borderRadius: 7, cursor: 'pointer',
                   background: isSelected && selectedFolder === 'INBOX'
-                    ? 'var(--bg-hover)' : 'transparent',
+                    ? headerBgHover : headerBg,
+                  boxShadow: sidebarCollapsed
+                    ? 'none'
+                    : `inset 3px 0 0 ${account.sync_error ? 'var(--red)' : accColor}`,
                   transition: 'background 0.1s',
                   justifyContent: sidebarCollapsed ? 'center' : 'flex-start',
                 }}
                 onMouseEnter={e => {
                   if (!(isSelected && selectedFolder === 'INBOX'))
-                    e.currentTarget.style.background = 'var(--bg-tertiary)';
+                    e.currentTarget.style.background = headerBgHover;
                 }}
                 onMouseLeave={e => {
                   if (!(isSelected && selectedFolder === 'INBOX'))
-                    e.currentTarget.style.background = 'transparent';
+                    e.currentTarget.style.background = headerBg;
                 }}
                 onClick={selectInbox}
                 onContextMenu={!sidebarCollapsed ? (e) => openAccountCtxMenu(e, account) : undefined}
@@ -1220,13 +1233,7 @@ export default function Sidebar() {
                   }}>
                     {(account.name || account.email_address || '?').charAt(0).toUpperCase()}
                   </div>
-                ) : (
-                  <div style={{
-                    width: 8, height: 8, borderRadius: '50%',
-                    background: account.color, flexShrink: 0,
-                    boxShadow: account.sync_error ? '0 0 0 2px rgba(248,113,113,0.4)' : 'none',
-                  }} />
-                )}
+                ) : null /* Fork: pastille remplacée par la bande teintée de l'en-tête */}
 
                 {!sidebarCollapsed && (
                   <>
@@ -1399,7 +1406,7 @@ export default function Sidebar() {
                           display: 'flex', alignItems: 'center', gap: 6,
                           padding: `6px 10px 6px ${indent}px`, borderRadius: 7,
                           cursor: isRenaming ? 'default' : 'pointer',
-                          background: (msgDragTarget === `${account.id}:${folder.path}`) ? 'var(--accent-dim)' : isFolderSelected ? 'var(--bg-hover)' : 'transparent',
+                          background: (msgDragTarget === `${account.id}:${folder.path}`) ? 'var(--accent-dim)' : isFolderSelected ? folderBgSelected : folderBg,
                           transition: 'background 0.1s',
                           boxShadow: dropPosition === 'before'
                             ? 'inset 0 2px var(--accent)'
@@ -1407,8 +1414,8 @@ export default function Sidebar() {
                               ? 'inset 0 -2px var(--accent)'
                               : 'none',
                         }}
-                        onMouseEnter={e => { if (!isFolderSelected && !isRenaming) e.currentTarget.style.background = 'var(--bg-tertiary)'; }}
-                        onMouseLeave={e => { if (!isFolderSelected) e.currentTarget.style.background = 'transparent'; }}
+                        onMouseEnter={e => { if (!isFolderSelected && !isRenaming) e.currentTarget.style.background = folderBgHover; }}
+                        onMouseLeave={e => { if (!isFolderSelected) e.currentTarget.style.background = folderBg; }}
                         onClick={() => !isRenaming && setSelectedAccount(account.id, folder.path)}
                         onContextMenu={e => openFolderCtxMenu(e, account.id, folder)}
                         onDragOver={event => {
