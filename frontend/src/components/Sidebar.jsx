@@ -1185,6 +1185,7 @@ export default function Sidebar() {
           const folderBg        = `color-mix(in srgb, ${accColor} 8%, var(--bg-primary))`;
           const folderBgHover   = `color-mix(in srgb, ${accColor} 16%, var(--bg-primary))`;
           const folderBgSelected = `color-mix(in srgb, ${accColor} 26%, var(--bg-primary))`;
+          const folderSep        = `color-mix(in srgb, ${accColor} 38%, var(--bg-primary))`;
 
           return (
             <div key={account.id}>
@@ -1404,11 +1405,12 @@ export default function Sidebar() {
                       <div
                         style={{
                           display: 'flex', alignItems: 'center', gap: 6,
-                          padding: `6px 10px 6px ${indent}px`, borderRadius: 7,
+                          padding: `6px 10px 6px ${indent}px`, borderRadius: 0,
                           cursor: isRenaming ? 'default' : 'pointer',
                           background: (msgDragTarget === `${account.id}:${folder.path}`) ? 'var(--accent-dim)' : isFolderSelected ? folderBgSelected : folderBg,
-                          // Fork: fine séparation visible entre dossiers
-                          borderBottom: '1px solid var(--border-subtle)',
+                          // Fork: séparation nette entre dossiers, teinte soutenue du compte
+                          // (borderRadius 0 pour que le trait aille bord à bord)
+                          borderBottom: `1px solid ${folderSep}`,
                           transition: 'background 0.1s',
                           boxShadow: dropPosition === 'before'
                             ? 'inset 0 2px var(--accent)'
