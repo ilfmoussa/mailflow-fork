@@ -8,15 +8,24 @@ import { getEffectiveShortcuts, parseModKey, modCompactLabel } from '../utils/de
 import { useMobile } from '../hooks/useMobile.js';
 import { clearDeleteGuard, clearPendingDelete, setCompletedDelete, setPendingDelete } from '../utils/pendingDeletes.js';
 import { pendingMarkReadMap, completedMarkReadMap, setPending } from '../utils/pendingReads.js';
+import { applyMarkRead, scheduleMarkRead } from '../utils/markRead.js';
 import DOMPurify from 'dompurify';
 import { BUILTIN_SUMMARIZE, summarizePromptForLocale } from '../aiActions.js';
 import { getResults, saveResult, removeResult } from '../aiResults.js';
+import { aiRuns } from '../utils/aiRunRegistry.js';
 import { renderMarkdown } from '../utils/renderMarkdown.js';
-import { pickReplyAlias } from '../utils/replyAlias.js';
-import { measureContentHeight, createHeightController, forceEagerImages } from '../utils/emailFrameHeight.js';
+import { openReplyFromMessage, openForwardFromMessage } from '../utils/composeFromMessage.js';
+import MessageBodyView from './MessageBodyView.jsx';
 import { copyToClipboard } from '../utils/clipboard.js';
+import { folderMatchesQuery } from '../utils/folderDisplay.js';
+import FolderPathLabel from './FolderPathLabel.jsx';
+import SpamBadge from './SpamBadge.jsx';
+import SpamExplainModal from './SpamExplainModal.jsx';
+import { classifyAttachmentRisk } from '../utils/attachmentRisk.js';
 const USE_DIV_RENDER = import.meta.env.VITE_EMAIL_DIV_RENDER === 'true';
 const MESSAGE_OPENING_EVENT = 'mailflow:message-opening';
+// riskArmed value for the "Download all" link. A Symbol, so no attachment part can ever equal it.
+const DOWNLOAD_ALL = Symbol('downloadAll');
 
 // Module-level regex so the spam-name heuristic isn't recompiled on every
 // render — same heuristic as ContextMenu.jsx, both files read this constant.
@@ -40,13 +49,6 @@ import FolderIcon from './FolderIcon.jsx';
 import TodoistTaskModal from './TodoistTaskModal.jsx';
 import SenderAvatarImage from './SenderAvatarImage.jsx';
 import ContextMenu from './ContextMenu.jsx';
-
-function parseAddressField(raw) {
-  try {
-    const arr = Array.isArray(raw) ? raw : JSON.parse(raw || '[]');
-    return arr.map(a => a.name ? `${a.name} <${a.email}>` : a.email).filter(Boolean).join(', ');
-  } catch { return ''; }
-}
 
 function linkifyText(text) {
   const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -133,36 +135,8 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     api.getMessageBody(msg.id).catch(() => {});
     setSelectedMessage(msg.id);
     clearTimeout(autoMarkReadTimerRef.current);
-    autoMarkReadTimerRef.current = null;
-    if (!msg.is_read) {
-      const { markReadBehavior, markReadDelay } = useStore.getState();
-      if (markReadBehavior === 'manual') return;
-      const doMarkRead = () => {
-        updateMessage(msg.id, { is_read: true });
-        decrementUnread(msg.account_id);
-        adjustCategoryCount(msg.category, -1);
-        setPending(msg.id, msg.account_id);
-        api.bulkRead([msg.id], true)
-          .then(() => {
-            pendingMarkReadMap.delete(msg.id);
-            completedMarkReadMap.set(msg.id, msg.account_id);
-            setTimeout(() => completedMarkReadMap.delete(msg.id), 10000);
-          })
-          .catch(e => {
-            console.error('markRead failed:', e.message);
-            updateMessage(msg.id, { is_read: false });
-            incrementUnread(msg.account_id);
-            adjustCategoryCount(msg.category, 1);
-            pendingMarkReadMap.delete(msg.id);
-          });
-      };
-      if (markReadBehavior === 'delay') {
-        autoMarkReadTimerRef.current = setTimeout(doMarkRead, (markReadDelay || 1) * 1000);
-      } else {
-        doMarkRead();
-      }
-    }
-  }, [setSelectedMessage, updateMessage, decrementUnread, incrementUnread, adjustCategoryCount]);
+    autoMarkReadTimerRef.current = scheduleMarkRead(msg);
+  }, [setSelectedMessage]);
 
   const paneRef = useRef(null);
   const mountedRef = useRef(true);
@@ -204,9 +178,11 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   }, [selectedMessageId]);
 
   useEffect(() => {
-    // Abort any actions still streaming for the previous message.
-    Object.values(aiAbortRefs.current).forEach(c => c?.abort());
-    aiAbortRefs.current = {};
+    // Deliberately does NOT abort in-flight actions. They persist their own result against the
+    // message they were started from, so leaving a message lets the work finish instead of
+    // discarding it (#428). Only dismissal, re-running the same action, and an identity change
+    // (logout, account switch, lock) cancel a run. Unmount deliberately does not.
+    viewingMsgIdRef.current = selectedMessageId;
     setShowAiMenu(false);
     // Restore persisted results (#204) so they reappear instead of vanishing.
     const saved = getResults(selectedMessageId);
@@ -307,6 +283,7 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const [moveSearch, setMoveSearch] = useState('');
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [contextMenu, setContextMenu] = useState(null);
+  const [spamExplainMessageId, setSpamExplainMessageId] = useState(null);
   const [findDialogOpen, setFindDialogOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findMatchCase, setFindMatchCase] = useState(false);
@@ -323,11 +300,14 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const moveBtnRef = useRef(null);
   const moreMenuRef = useRef(null);
   const aiMenuRef = useRef(null);
-  // One AbortController per in-flight action, keyed by action key.
-  const aiAbortRefs = useRef({});
+  // In-flight AI actions live in a module-level registry, keyed by message AND action, so they
+  // outlive this component. Navigating, closing a pop-out and changing layout all deliberately
+  // leave them running: the result is saved against the message it was started from, so letting
+  // the request finish is what puts it there when you return (#428). utils/aiRunRegistry.js.
+  // The message currently on screen, read inside async callbacks that outlive a navigation.
+  const viewingMsgIdRef = useRef(selectedMessageId);
   const scrollContainerRef = useRef(null);
   const iframeRef = useRef(null);
-  const roRef = useRef(null);
   // useMemo so prepared is available in the same render as body.html — no extra frame,
   // no flash of empty content between skeleton-gone and email-shown.
   const prepared = useMemo(() => {
@@ -535,284 +515,9 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   // so email CSS can never make html/body fill the iframe height.  We never toggle
   // overflow here, which eliminates the feedback loop where clearing overflow lets
   // percentage-height elements expand → body grows → observer fires → repeat.
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe || !body?.html) return;
-
-    let rafId;
-    let pollId = null;
-    const heights = createHeightController();
-    let initialisedDoc = null;
-    let contextMenuDoc = null;
-    let iframeContextMenuHandler = null;
-    let clickDoc = null;
-    let iframeClickHandler = null;
-
-    const setHeight = () => {
-      const doc = iframe.contentDocument;
-      if (!doc) return;
-      const b = doc.body;
-      const wrapper = doc.getElementById('mf-scale-wrapper');
-      // documentElement is deliberately NOT measured: its scrollHeight is floored by
-      // the frame's own viewport, so once the frame is N tall every reading is >= N
-      // and an over-estimate can never be walked back. That floor, not the guard that
-      // used to sit below it, is what left whitespace under short emails.
-      const h = measureContentHeight({
-        wrapperOffsetHeight: wrapper ? wrapper.offsetHeight : 0,
-        wrapperOffsetTop:    wrapper ? wrapper.offsetTop    : 0,
-        bodyScrollHeight:    b ? b.scrollHeight : 0,
-        bodyOffsetHeight:    b ? b.offsetHeight : 0,
-      });
-      // Scale visual height to match the proportional scale applied to the
-      // email wrapper (1 for normal emails, <1 for wide fixed-layout emails).
-      // offsetHeight above is untransformed, so the factor applies exactly once.
-      const next = heights.next(h, emailScaleRef.current);
-      if (next !== null) iframe.style.height = next + 'px';
-    };
-
-    const onLoaded = () => {
-      const doc = iframe.contentDocument;
-      // Only ever initialise against OUR document. A freshly mounted frame exposes an
-      // about:blank whose readyState is already 'complete', and a frame whose srcDoc has
-      // just changed still exposes the PREVIOUS email until the swap lands. Either way the
-      // readyState fast path further down can fire against a document that is not this
-      // email, measuring it and binding a ResizeObserver to it. #mf-scale-wrapper is only
-      // present in a document we rendered, which makes it a reliable marker.
-      if (!doc || !doc.getElementById('mf-scale-wrapper')) return;
-      // Guard the fast path against re-running on a document already wired up. This is
-      // per effect run, so a genuine re-run (changed deps) still re-attaches everything
-      // the cleanup tore down.
-      if (doc === initialisedDoc) return;
-      initialisedDoc = doc;
-
-      emailScaleRef.current = 1; // reset for each new email
-
-      // Start every image fetching now, rather than letting the browser defer them.
-      //
-      // Lazy loading is gated on the scroll viewport, and for an iframe that viewport is
-      // the frame's own box, which starts at 300px. Images below that never fetch, so they
-      // measure as zero height, so the frame is sized short, which brings the next image
-      // into range, which fetches, which grows the content, which resizes the frame again.
-      // Every step of that staircase costs a network round trip, and a marketing email with
-      // nine stacked images renders in visible instalments. Looking at it mid-staircase is
-      // the "half loaded" email; it only appears fixed on a second visit because the images
-      // are cached by then.
-      //
-      // Nothing is lost by loading eagerly: the frame has no internal scrolling and is
-      // sized to its full content, so every image ends up on screen regardless.
-      //
-      // Done against the DOM rather than by rewriting the srcDoc HTML so there is no chance
-      // of matching the attribute inside text content. Flipping here, before the load
-      // handlers further down are attached, is safe because everything between is
-      // synchronous: a fetch cannot deliver its load event until this function yields, by
-      // which point the handlers exist. The ResizeObserver on the body is the backstop
-      // regardless.
-      forceEagerImages(doc);
-
-      // Some marketing emails have inline styles on their <body> tag (e.g. overflow:auto,
-      // height:100%) that the HTML parser merges into the iframe's outer <body>.  Our
-      // injected <style> with !important can't win against inline !important rules.
-      // Setting the properties via JS style.setProperty(...,'important') writes them as
-      // inline !important, which always beats any same-property inline value from the email.
-      const b = doc.body;
-      const h = doc.documentElement;
-      if (b) {
-        b.style.setProperty('height', 'auto', 'important');
-        b.style.setProperty('min-height', '0', 'important');
-        b.style.setProperty('overflow-y', 'hidden', 'important');
-      }
-      if (h) {
-        h.style.setProperty('height', 'auto', 'important');
-        h.style.setProperty('min-height', '0', 'important');
-        h.style.setProperty('overflow-y', 'hidden', 'important');
-      }
-
-      // Some marketing emails (e.g. Avis) use class-based !important rules that
-      // lock layout to a fixed pixel width and cannot be overridden by our injected
-      // CSS. Measure the rendered content width and, if it exceeds the iframe,
-      // scale the entire wrapper div down proportionally so all content is visible.
-      const iframeW = iframe.offsetWidth;
-      if (iframeW > 0) {
-        // iOS Safari clamps scrollWidth to the iframe viewport when overflow:hidden
-        // is set on html/body, so wide fixed-layout emails are never detected.
-        // Temporarily expose overflow-x inline (beating the !important stylesheet
-        // rule) to let scrollWidth reflect the true content width, then restore.
-        // Note: overflow-x:visible is coerced to auto when overflow-y is non-visible —
-        // that's fine; auto still returns the real scrollable content width.
-        if (b) b.style.setProperty('overflow-x', 'visible', 'important');
-        if (h) h.style.setProperty('overflow-x', 'visible', 'important');
-        const contentW = Math.max(
-          h ? h.scrollWidth : 0,
-          b ? b.scrollWidth : 0,
-        );
-        if (b) b.style.removeProperty('overflow-x');
-        if (h) h.style.removeProperty('overflow-x');
-
-        const wrapper = doc.getElementById('mf-scale-wrapper');
-        if (contentW > iframeW + 2) { // +2 absorbs sub-pixel rounding
-          const scale = iframeW / contentW;
-          emailScaleRef.current = scale;
-          if (wrapper) {
-            wrapper.style.transform       = `scale(${scale})`;
-            wrapper.style.transformOrigin = 'top left';
-            // Lock the wrapper at its natural content width so the scale
-            // maps exactly contentW → iframeW with no clipping.
-            wrapper.style.width           = `${contentW}px`;
-          }
-        }
-      }
-
-      // Expand any nested scroll containers so their full content is visible
-      // without internal scrolling. Marketing emails sometimes apply overflow:auto
-      // plus a fixed height to inner divs/tds, which makes iOS scroll that element
-      // instead of the outer pane container — leaving the sender card pinned like a
-      // sticky header.
-      //
-      // Process in REVERSE document order (deepest elements first) so that when we
-      // expand an inner scroll container, the outer container's scrollHeight already
-      // reflects the expanded child when we evaluate it — preventing missed outer
-      // containers in a single pass.
-      //
-      // expandedEls tracks which elements we've already expanded so that subsequent
-      // calls from image load handlers can re-check and grow them as lazy images add
-      // height (an element that was 1 000 px after the first pass may be 3 000 px
-      // once all images are loaded).
-      const expandedEls = new Set();
-      const dv = doc.defaultView;
-      const expandScrollContainers = () => {
-        if (!dv) return;
-        Array.from(doc.querySelectorAll('*')).reverse().forEach(el => {
-          const cs = dv.getComputedStyle(el);
-          const oy = cs.overflowY;
-          const isScrollContainer = (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 2;
-          const grewAfterExpansion = expandedEls.has(el) && el.scrollHeight > el.clientHeight + 2;
-          if (isScrollContainer || grewAfterExpansion) {
-            expandedEls.add(el);
-            el.style.setProperty('overflow-y', 'hidden', 'important');
-            el.style.setProperty('max-height', 'none', 'important');
-            el.style.setProperty('height', el.scrollHeight + 'px', 'important');
-          }
-        });
-      };
-      expandScrollContainers();
-
-      // Recalculate from scratch with the new scale. The controller deliberately does
-      // not seed itself from the frame's current height, so this measurement is
-      // authoritative even when it is SHORTER than what is currently applied. That is
-      // what clears leftover whitespace when the previous email was taller.
-      heights.reset();
-      setHeight();
-      rafId = requestAnimationFrame(setHeight);
-
-      // Intercept all link clicks so they always open in a real browser tab.
-      // Without this, relative hrefs (e.g. href="/") resolve to the mailflow
-      // origin via allow-same-origin and open a new mailflow tab instead of
-      // the intended destination.  We read the raw attribute to bypass
-      // browser resolution and only forward absolute http(s)/mailto links.
-      // Tracked and removed like the contextmenu handler below — onLoaded can
-      // re-run on the same document when the effect's callback deps change,
-      // and an untracked listener stacks up, opening N duplicate tabs per click.
-      if (clickDoc && iframeClickHandler) {
-        clickDoc.removeEventListener('click', iframeClickHandler);
-      }
-      iframeClickHandler = (ev) => {
-        const anchor = ev.target.closest('a[href]');
-        if (!anchor) return;
-        ev.preventDefault();
-        let raw = anchor.getAttribute('href') || '';
-        if (raw.startsWith('//')) raw = 'https:' + raw;
-        if (/^https?:\/\//i.test(raw)) {
-          window.open(raw, '_blank', 'noopener,noreferrer');
-        } else if (/^mailto:/i.test(raw)) {
-          window.open(raw, '_blank', 'noopener,noreferrer');
-        }
-      };
-      clickDoc = doc;
-      doc.addEventListener('click', iframeClickHandler);
-
-      if (contextMenuDoc && iframeContextMenuHandler) {
-        contextMenuDoc.removeEventListener('contextmenu', iframeContextMenuHandler);
-      }
-      iframeContextMenuHandler = (ev) => {
-        if (hasNativeContextTarget(ev, doc)) return;
-        ev.preventDefault();
-        const rect = iframe.getBoundingClientRect();
-        openPaneContextMenu(rect.left + ev.clientX, rect.top + ev.clientY, {
-          source: 'iframe',
-          selectedText: doc.getSelection?.().toString() || '',
-        });
-      };
-      contextMenuDoc = doc;
-      doc.addEventListener('contextmenu', iframeContextMenuHandler);
-
-      // Re-measure after each lazy-loaded image settles; also re-expand any
-      // scroll containers whose content has grown due to the newly loaded image.
-      doc.querySelectorAll('img').forEach(img => {
-        if (!img.complete) {
-          img.addEventListener('load', () => { expandScrollContainers(); requestAnimationFrame(setHeight); }, { once: true });
-          img.addEventListener('error', () => requestAnimationFrame(setHeight), { once: true });
-        }
-      });
-
-      // Watch for content that reflows after load (web fonts, dynamic content).
-      // Shrinking is allowed here: content height cannot depend on frame height,
-      // because html/body are pinned to height:auto above and media queries key off
-      // width. createHeightController still carries a tolerance band plus an
-      // oscillation freeze in case some email defeats that reasoning.
-      const root = doc.body || doc.documentElement;
-      if (window.ResizeObserver && root) {
-        // Disconnect first: onLoaded can legitimately run more than once per effect
-        // (stale document, then the real one), and overwriting the ref without this
-        // leaves the previous observer running against the old document forever.
-        if (roRef.current) roRef.current.disconnect();
-        roRef.current = new ResizeObserver(() => requestAnimationFrame(setHeight));
-        roRef.current.observe(root);
-      }
-    };
-
-    // 'load' is kept, but it CANNOT be the only trigger. It waits for every subresource,
-    // so a single image that never settles (a dead tracking pixel, a blocked host, a host
-    // that accepts the connection and never answers) leaves the document parked at
-    // readyState 'interactive' forever. load never fires, none of the setup above ever
-    // runs, and the frame sits at its initial 300px with the email clipped inside it. One
-    // unreachable image was enough to break rendering of the whole message.
-    //
-    // Not { once: true } either: a frame fires 'load' for the about:blank it starts life
-    // with, and a once-listener is spent on that even though onLoaded correctly declines
-    // to initialise against a document that is not ours.
-    iframe.addEventListener('load', onLoaded);
-
-    // Everything onLoaded does needs only a parsed DOM, never a finished one, so drive it
-    // from the parsed state and let the image handlers and the ResizeObserver grow the
-    // frame as pictures arrive. Polling by frame rather than listening for
-    // DOMContentLoaded because the document to listen on does not exist yet at this point:
-    // the frame is still showing about:blank and swaps in the real one later. onLoaded is
-    // idempotent per document, so the repeated calls are free and stop as soon as one
-    // succeeds.
-    let pollFrames = 0;
-    const MAX_POLL_FRAMES = 300; // ~5s at 60fps; srcDoc parses far sooner
-    const pollUntilParsed = () => {
-      pollId = null;
-      onLoaded();
-      if (initialisedDoc || pollFrames++ >= MAX_POLL_FRAMES) return;
-      pollId = requestAnimationFrame(pollUntilParsed);
-    };
-    pollUntilParsed();
-
-    return () => {
-      cancelAnimationFrame(rafId);
-      if (pollId) cancelAnimationFrame(pollId);
-      if (roRef.current) { roRef.current.disconnect(); roRef.current = null; }
-      if (contextMenuDoc && iframeContextMenuHandler) {
-        contextMenuDoc.removeEventListener('contextmenu', iframeContextMenuHandler);
-      }
-      if (clickDoc && iframeClickHandler) {
-        clickDoc.removeEventListener('click', iframeClickHandler);
-      }
-      iframe.removeEventListener('load', onLoaded);
-      emailScaleRef.current = 1;
-    };
-  }, [body?.html, selectedMessageId, hasNativeContextTarget, openPaneContextMenu]);
+  // The email body frame lives in MessageBodyView, which owns the effect that sizes it and
+  // wires its document. The frame node is forwarded back here, so selection, find, the
+  // context menu and the height reset above all still reach it directly.
 
   // Inject scoped email styles before paint so there is no flash of unstyled content.
   // useLayoutEffect runs synchronously after DOM mutations and before the browser paints,
@@ -1055,114 +760,20 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     };
   }, [isMobile, setSelectedMessage, resetPaneSwipeStyles]);
 
+  // Both drafts are built by the shared util, so replying from the list, from the
+  // reading pane, from a conversation and from GTD triage all produce the same draft.
+  // The body is already loaded here, so it is handed over rather than refetched.
+  const loadedBody = async () => body;
+
   const handleReply = (replyAll = false) => {
     if (!message) return;
-    const date = message.date ? new Date(message.date).toLocaleString() : '';
-    const safeName = (message.from_name || '').replace(/[\r\n]+/g, ' ');
-    const fromStr = safeName
-      ? `${safeName} <${message.from_email}>`
-      : message.from_email || '';
-    const quotedText = body?.text
-      ? `\n\n---\nOn ${date}, ${fromStr} wrote:\n${body.text.split('\n').map(l => '> ' + l).join('\n')}`
-      : '';
-    const quotedBodyHtml = body?.html
-      ? `<div style="border-left:3px solid var(--border,#ccc);padding-left:12px;margin-top:12px;color:var(--text-secondary,#666)"><p style="margin:0 0 6px;font-size:12px">On ${date}, ${fromStr} wrote:</p>${body.html}</div>`
-      : null;
-
-    const replyToArr = Array.isArray(message.reply_to)
-      ? message.reply_to
-      : (() => { try { return JSON.parse(message.reply_to || '[]'); } catch { return []; } })();
-    const replyTarget = (replyToArr.length && replyToArr[0].email)
-      ? replyToArr[0]
-      : { name: message.from_name || '', email: message.from_email || '' };
-    const sender = replyTarget.email ? [replyTarget] : [];
-
-    const myAccount = accounts.find(a => a.id === message.account_id);
-    const myEmail = myAccount?.email_address || '';
-
-    const replyAliasId = pickReplyAlias({
-      aliases: myAccount?.aliases || [],
-      deliveryAddresses: message.delivery_addresses,
-      toAddresses: message.to_addresses,
-      ccAddresses: message.cc_addresses,
-      fromEmail: message.from_email,
-    });
-
-    const myAddresses = new Set([
-      myEmail.toLowerCase(),
-      ...(myAccount?.aliases || []).map(al => al.email.toLowerCase()),
-    ]);
-    const allRecipients = (() => {
-      try {
-        const toArr = Array.isArray(message.to_addresses)
-          ? message.to_addresses
-          : JSON.parse(message.to_addresses || '[]');
-        const ccArr = Array.isArray(message.cc_addresses)
-          ? message.cc_addresses
-          : JSON.parse(message.cc_addresses || '[]');
-        return [...toArr, ...ccArr].filter(
-          t => t.email && !myAddresses.has(t.email.toLowerCase()) && t.email !== replyTarget.email
-        );
-      } catch { return []; }
-    })();
-
-    const referencesChain = [message.in_reply_to, message.message_id]
-      .filter(Boolean).join(' ').trim() || null;
-
-    const rawSubject = (message.subject || '').trim();
-    const reSubject = rawSubject.startsWith('Re:') ? rawSubject : rawSubject ? `Re: ${rawSubject}` : 'Re:';
-
     setShowReplyMenu(false);
-    openCompose({
-      to: sender,
-      cc: replyAll ? allRecipients : [],
-      subject: reSubject,
-      body: '',
-      quotedBody: quotedText,
-      quotedBodyHtml,
-      inReplyTo: message.message_id,
-      references: referencesChain,
-      accountId: message.account_id,
-      aliasId: replyAliasId,
-      isReply: true,
-      isReplyAll: replyAll,
-      originalFrom: sender,
-      allRecipients,
-      threadId: message.thread_id,
-    });
+    openReplyFromMessage(message, { accounts, openCompose, getMessageBody: loadedBody, replyAll });
   };
 
   const handleForward = () => {
     if (!message) return;
-    const date = message.date ? new Date(message.date).toLocaleString() : '';
-    const safeName = (message.from_name || '').replace(/[\r\n]+/g, ' ');
-    const fromStr = safeName
-      ? `${safeName} <${message.from_email}>`
-      : message.from_email || '';
-    const safeSubject = (message.subject || '').replace(/[\r\n]+/g, ' ');
-
-    const toStr = parseAddressField(message.to_addresses);
-    const ccStr = parseAddressField(message.cc_addresses);
-
-    const fwdText = `\n\n---------- Forwarded message ----------\nFrom: ${fromStr}\nDate: ${date}\nSubject: ${safeSubject}${toStr ? `\nTo: ${toStr}` : ''}${ccStr ? `\nCc: ${ccStr}` : ''}\n\n${body?.text || ''}`;
-    const fwdHtml = body?.html
-      ? `<div style="border-left:3px solid var(--border,#ccc);padding-left:12px;margin-top:12px;color:var(--text-secondary,#666)"><p style="margin:0 0 6px;font-size:12px">---------- Forwarded message ----------<br>From: ${fromStr}<br>Date: ${date}<br>Subject: ${safeSubject}${toStr ? `<br>To: ${toStr}` : ''}${ccStr ? `<br>Cc: ${ccStr}` : ''}</p>${body.html}</div>`
-      : null;
-    openCompose({
-      subject: message.subject?.startsWith('Fwd:') ? message.subject : `Fwd: ${message.subject}`,
-      body: '',
-      quotedBody: fwdText,
-      quotedBodyHtml: fwdHtml,
-      accountId: message.account_id,
-      isForward: true,
-      forwardedAttachments: (body?.attachments || []).map(att => ({
-        messageId: message.id,
-        part: att.part,
-        filename: att.filename || 'attachment',
-        type: att.type || 'application/octet-stream',
-        size: att.size || 0,
-      })),
-    });
+    openForwardFromMessage(message, { openCompose, getMessageBody: loadedBody });
   };
 
   const handleStarToggle = async () => {
@@ -1254,11 +865,12 @@ ${bodyContent}
     if (!textContent) return;
 
     const label = aiActionLabel(key, action.label);
-    aiAbortRefs.current[key]?.abort();
-    const ctrl = new AbortController();
-    aiAbortRefs.current[key] = ctrl;
     const msgId = selectedMessageId;
-    setAiResults(r => ({ ...r, [key]: { status: 'loading', text: '', label } }));
+    const ctrl = aiRuns.start(msgId, key, new AbortController());
+    // Only paint into the pane while the message this run belongs to is the one on screen.
+    // A run that outlives a navigation still saves; the restore on return shows it.
+    const applyIfViewing = (updater) => { if (viewingMsgIdRef.current === msgId) setAiResults(updater); };
+    applyIfViewing(r => ({ ...r, [key]: { status: 'loading', text: '', label } }));
     // The built-in Summarize prompt is uneditable, so steer its output to the
     // user's UI language (#255). Custom actions keep their author's prompt as-is.
     const promptText = action.builtin ? summarizePromptForLocale(i18n.language) : action.prompt;
@@ -1269,21 +881,23 @@ ${bodyContent}
       }], {
         signal: ctrl.signal,
         onDelta: (text) => {
-          setAiResults(r => ({ ...r, [key]: { status: 'loading', text, label } }));
+          applyIfViewing(r => ({ ...r, [key]: { status: 'loading', text, label } }));
         },
       });
-      setAiResults(r => ({ ...r, [key]: { status: 'done', text: fullText, label } }));
-      // Persist only completed results, keyed to the message it ran against.
+      applyIfViewing(r => ({ ...r, [key]: { status: 'done', text: fullText, label } }));
+      // Persist unconditionally: this is the whole point when the user has navigated away.
       if (fullText) saveResult(msgId, key, fullText, label);
     } catch (err) {
       if (err.name === 'AbortError') return;
-      setAiResults(r => ({ ...r, [key]: { status: 'error', text: err.message, label } }));
+      applyIfViewing(r => ({ ...r, [key]: { status: 'error', text: err.message, label } }));
+    } finally {
+      aiRuns.finish(msgId, key);
     }
   };
 
   // Dismiss a pinned result box and drop its cached copy.
   const dismissAiResult = (key) => {
-    aiAbortRefs.current[key]?.abort();
+    aiRuns.abort(selectedMessageId, key);
     removeResult(selectedMessageId, key);
     setAiResults(r => { const next = { ...r }; delete next[key]; return next; });
   };
@@ -1342,8 +956,15 @@ ${bodyContent}
 
   useEffect(() => {
     api.ai.status().then(setAiStatus).catch(() => {});
-    return () => { Object.values(aiAbortRefs.current).forEach(c => c?.abort()); };
+    // No abort on unmount: the pane also unmounts when a pop-out closes or the layout changes,
+    // and a run the user is still waiting for must survive that. Identity changes cancel runs
+    // instead, from the store, where logout and account switch are actually known about.
   }, []);
+
+  // riskArmed: a risky attachment needs a second click to download; the first
+  // arms the button and shows why. Holds the attachment's part, or DOWNLOAD_ALL.
+  const [riskArmed, setRiskArmed] = useState(null);
+  useEffect(() => { setRiskArmed(null); }, [selectedMessageId]);
 
   const handleDownload = async (messageId, part, filename) => {
     setDownloadingPart(part);
@@ -1720,19 +1341,8 @@ ${bodyContent}
         handlePrint();
         break;
       case 'markRead':
-        if (!message.is_read) {
-          updateMessage(message.id, { is_read: true });
-          decrementUnread(message.account_id);
-          adjustCategoryCount(message.category, -1);
-          setPending(message.id, message.account_id);
-          api.bulkRead([message.id], true).catch(e => {
-            console.error('markRead failed:', e.message);
-            updateMessage(message.id, { is_read: false });
-            incrementUnread(message.account_id);
-            adjustCategoryCount(message.category, 1);
-            pendingMarkReadMap.delete(message.id);
-          });
-        }
+        // Explicit "mark read" ignores markReadBehavior: the user just asked for it.
+        applyMarkRead(message);
         break;
       case 'markUnread':
         handleMarkUnread();
@@ -1928,6 +1538,23 @@ ${bodyContent}
   })();
 
   const attachments = body?.attachments || [];
+  // "Download all" hands over every file at once, so it asks first whenever one of them would. While
+  // it does, the link has no href, so a right-click "Save link as", a middle click or a long press has
+  // nothing to fetch; the confirming click starts the download itself.
+  const anyRiskyAttachment = attachments.some(att =>
+    ['block', 'warn'].includes(classifyAttachmentRisk(att.filename, att.type).level));
+  const downloadAllArmed = riskArmed === DOWNLOAD_ALL;
+  const downloadAllUrl = message ? `/api/mail/messages/${message.id}/attachments.zip` : '';
+  const confirmDownloadAll = () => {
+    if (!downloadAllArmed) { setRiskArmed(DOWNLOAD_ALL); return; }
+    setRiskArmed(null);
+    const a = document.createElement('a');
+    a.href = downloadAllUrl;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
 
   return (
     <div
@@ -2136,7 +1763,7 @@ ${bodyContent}
                     const q = moveSearch.trim().toLowerCase();
                     if (q) {
                       const filtered = movePickerFolders
-                        .filter(f => f.path !== message.folder && f.name.toLowerCase().includes(q));
+                        .filter(f => f.path !== message.folder && folderMatchesQuery(f, q));
                       return filtered.length === 0 ? (
                         <div style={{ padding: '12px 12px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
                           {t('contextMenu.folders.empty')}
@@ -2150,7 +1777,7 @@ ${bodyContent}
                           onMouseLeave={e => e.currentTarget.style.background = 'none'}
                         >
                           <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                          <FolderPathLabel folder={f} />
                         </button>
                       ));
                     }
@@ -2170,7 +1797,7 @@ ${bodyContent}
                                 onMouseLeave={e => e.currentTarget.style.background = 'none'}
                               >
                                 <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                                <FolderPathLabel folder={f} />
                               </button>
                             ))}
                             <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -2190,7 +1817,7 @@ ${bodyContent}
                                 onMouseLeave={e => e.currentTarget.style.background = 'none'}
                               >
                                 <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                                <FolderPathLabel folder={f} />
                               </button>
                             ))}
                             <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -2207,7 +1834,7 @@ ${bodyContent}
                               onMouseLeave={e => e.currentTarget.style.background = 'none'}
                             >
                               <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                              <FolderPathLabel folder={f} />
                             </button>
                           ))
                         }
@@ -2245,10 +1872,10 @@ ${bodyContent}
                     onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
                     onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                   >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
-                      <path d="M22,9v9c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V9"/>
-                      <polyline points="22 9 12 16 2 9"/>
-                      <polyline points="22 9 12 2 22 9"/>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                      <path style={{strokeLinecap: 'round'}} d="M22,10.91v7.09c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V6c0-1.1.9-2,2-2h11"/>
+                      <polyline style={{strokeLinecap: 'round'} } points="16.36 9.95 12 13 2 6"/>
+                      <circle style={{strokeMiterlimit: 10, fill: 'currentColor'}} cx="19.96" cy="6" r="3"/>
                     </svg>
                     {t('contextMenu.markUnread')}
                   </div>
@@ -2378,10 +2005,10 @@ ${bodyContent}
             )}
             {message.is_read && (
               <PaneBtn onClick={handleMarkUnread} title={t('contextMenu.markUnread')}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
-                  <path d="M22,9v9c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V9"/>
-                  <polyline points="22 9 12 16 2 9"/>
-                  <polyline points="22 9 12 2 22 9"/>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                  <path style={{strokeLinecap: 'round'}} d="M22,10.91v7.09c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V6c0-1.1.9-2,2-2h11"/>
+                  <polyline style={{strokeLinecap: 'round'} } points="16.36 9.95 12 13 2 6"/>
+                  <circle style={{strokeMiterlimit: 10, fill: 'currentColor'}} cx="19.96" cy="6" r="3"/>
                 </svg>
               </PaneBtn>
             )}
@@ -2472,12 +2099,17 @@ ${bodyContent}
             color: 'var(--text-primary)', lineHeight: 1.3,
             fontFamily: 'var(--font-display)',
           }}>
-            {(() => {
-              const paneSubject = resolvedSubject || message.subject;
-              return (paneSubject && paneSubject !== '(no subject)')
-                ? paneSubject
-                : t('message.noSubject');
-            })()}
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+              <span>
+                {(() => {
+                  const paneSubject = resolvedSubject || message.subject;
+                  return (paneSubject && paneSubject !== '(no subject)')
+                    ? paneSubject
+                    : t('message.noSubject');
+                })()}
+              </span>
+              <SpamBadge message={message} onClick={(m) => setSpamExplainMessageId(m.id)} />
+            </div>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 16px' }}>
@@ -2612,11 +2244,15 @@ ${bodyContent}
               </div>
               {attachments.length > 1 && (
                 <a
-                  href={`/api/mail/messages/${message.id}/attachments.zip`}
-                  download
+                  {...(anyRiskyAttachment ? {
+                    role: 'button',
+                    tabIndex: 0,
+                    onClick: confirmDownloadAll,
+                    onKeyDown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); confirmDownloadAll(); } },
+                  } : { href: downloadAllUrl, download: true })}
                   style={{
-                    fontSize: 12, color: 'var(--accent)', textDecoration: 'none',
-                    display: 'flex', alignItems: 'center', gap: 4,
+                    fontSize: 12, color: downloadAllArmed ? 'var(--red)' : 'var(--accent)', textDecoration: 'none',
+                    display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
                   }}
                 >
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2624,21 +2260,35 @@ ${bodyContent}
                     <polyline points="7 10 12 15 17 10"/>
                     <line x1="12" y1="15" x2="12" y2="3"/>
                   </svg>
-                  {t('message.downloadAll')}
+                  {downloadAllArmed
+                    ? t('message.attachmentRisk.armed', { label: t('message.downloadAll') })
+                    : t('message.downloadAll')}
                 </a>
               )}
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {attachments.map((att, i) => (
+              {attachments.map((att, i) => {
+                const risk = classifyAttachmentRisk(att.filename, att.type);
+                const risky = risk.level === 'block' || risk.level === 'warn';
+                const riskColor = risk.level === 'block' ? 'var(--red)' : risk.level === 'warn' ? 'var(--amber)' : 'var(--text-tertiary)';
+                const armed = riskArmed === att.part;
+                const riskText = risk.level === 'ok' ? '' : risk.doubleExt
+                  ? t('message.attachmentRisk.doubleExt', { ext: risk.doubleExt })
+                  : t(`message.attachmentRisk.${risk.level}`, { ext: risk.ext });
+                return (
                 <button
                   key={i}
-                  onClick={() => handleDownload(message.id, att.part, att.filename)}
+                  onClick={() => {
+                    if (risky && !armed) { setRiskArmed(att.part); return; }
+                    setRiskArmed(null);
+                    handleDownload(message.id, att.part, att.filename);
+                  }}
                   disabled={downloadingPart === att.part}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 8,
                     padding: '8px 12px', borderRadius: 8,
                     background: 'var(--bg-secondary)',
-                    border: '1px solid var(--border)',
+                    border: `1px solid ${risky ? riskColor : 'var(--border)'}`,
                     cursor: downloadingPart === att.part ? 'wait' : 'pointer',
                     color: 'var(--text-primary)',
                     transition: 'background 0.1s',
@@ -2658,6 +2308,11 @@ ${bodyContent}
                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
                       {downloadingPart === att.part ? t('message.downloading') : formatBytes(att.size)}
                     </div>
+                    {risk.level !== 'ok' && (
+                      <div style={{ fontSize: 11, color: riskColor, fontWeight: risk.level === 'block' ? 600 : 400, whiteSpace: 'normal' }}>
+                        {armed ? t('message.attachmentRisk.armed', { label: riskText }) : riskText}
+                      </div>
+                    )}
                   </div>
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
                     stroke="var(--text-tertiary)" strokeWidth="2" style={{ flexShrink: 0 }}>
@@ -2666,7 +2321,8 @@ ${bodyContent}
                     <line x1="12" y1="15" x2="12" y2="3"/>
                   </svg>
                 </button>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -2900,48 +2556,13 @@ ${bodyContent}
                 </div>
               </div>
             ) : (
-              <iframe
-                ref={iframeRef}
-                srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8">
-                <meta name="viewport" content="width=device-width,initial-scale=1">
-                <meta name="color-scheme" content="only light">
-                <meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; style-src 'unsafe-inline';">
-                <base target="_blank">
-              </head><body><div id="mf-scale-wrapper">${
-                body.html.replace(/<a(\s)/gi, '<a rel="noopener noreferrer"$1')
-              }</div><style>
-                  /* Injected AFTER email HTML so our rules win the source-order tiebreak
-                     for same-specificity !important declarations inside the email's own
-                     <style> blocks (which land in <body> after the email HTML). */
-                  html, body { height: auto !important; min-height: 0 !important; overflow: hidden !important; }
-                  body { margin: 0 !important; padding: 0 !important;
-                         background-color: #ffffff !important; color-scheme: light;
-                         font-family: -apple-system, Arial, sans-serif;
-                         font-size: 14px; line-height: 1.6; color: #1a1a1a;
-                         word-wrap: break-word; overflow-wrap: break-word; }
-                  img { max-width: 100% !important; height: auto !important; }
-                  /* Force top-level wrapper tables to fill the viewport. Selectors cover
-                     both the legacy body > table pattern and the mf-scale-wrapper layer. */
-                  body > table, body > center > table,
-                  body > div > table, body > center > div > table,
-                  #mf-scale-wrapper > table, #mf-scale-wrapper > center > table,
-                  #mf-scale-wrapper > div > table, #mf-scale-wrapper > center > div > table {
-                    width: 100% !important;
-                  }
-                  /* Reset min-width on cells only — not on table elements, because fluid
-                     grid systems (e.g. Oracle Eloqua "tolkien") set min-width on inline-table
-                     column elements as a layout fallback when their calc() width resolves to 0. */
-                  td, th { min-width: 0 !important; }
-                  td { word-break: break-word; }
-                  th { overflow-wrap: normal; word-break: normal; }
-                  a { color: #6366f1; }
-                  pre, code { overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
-                  blockquote { border-left: 3px solid #ddd; margin: 0; padding-left: 12px; color: #555; }
-                </style></body></html>`}
-                scrolling="no"
-                style={{ width: '1px', minWidth: '100%', border: 'none', display: 'block', height: '300px' }}
-                sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                title={t('message.emailFrameTitle')}
+              <MessageBodyView
+                iframeRef={iframeRef}
+                body={body}
+                messageId={selectedMessageId}
+                emailScaleRef={emailScaleRef}
+                hasNativeContextTarget={hasNativeContextTarget}
+                onContextMenu={openPaneContextMenu}
               />
             )}
           </div>
@@ -3063,7 +2684,7 @@ ${bodyContent}
                 const q = moveSearch.trim().toLowerCase();
                 if (q) {
                   const filtered = movePickerFolders
-                    .filter(f => f.path !== message.folder && f.name.toLowerCase().includes(q));
+                    .filter(f => f.path !== message.folder && folderMatchesQuery(f, q));
                   return filtered.length === 0 ? (
                     <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
                       {t('contextMenu.folders.empty')}
@@ -3075,7 +2696,7 @@ ${bodyContent}
                       style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                     >
                       <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                      <FolderPathLabel folder={f} />
                     </button>
                   ));
                 }
@@ -3093,7 +2714,7 @@ ${bodyContent}
                             style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                           >
                             <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                            <FolderPathLabel folder={f} />
                           </button>
                         ))}
                         <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -3111,7 +2732,7 @@ ${bodyContent}
                             style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                           >
                             <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                            <FolderPathLabel folder={f} />
                           </button>
                         ))}
                         <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -3126,7 +2747,7 @@ ${bodyContent}
                           style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                         >
                           <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                          <FolderPathLabel folder={f} />
                         </button>
                       ))
                     }
@@ -3266,6 +2887,13 @@ ${bodyContent}
             setResolvedSubject(s);
             updateMessage(message.id, { subject: s });
           }}
+        />
+      )}
+
+      {spamExplainMessageId && (
+        <SpamExplainModal
+          messageId={spamExplainMessageId}
+          onClose={() => setSpamExplainMessageId(null)}
         />
       )}
 

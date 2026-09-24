@@ -1,3 +1,4 @@
+import { STATUS_STALE_MS } from '../services/folderStatus.js';
 import { Router } from 'express';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -5,6 +6,8 @@ const archiver = require('archiver');
 import { query } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { imapManager } from '../index.js';
+import { extractImapError } from '../services/imapError.js';
+import { isConnectionRefusal } from '../services/imapManager.js';
 import { sanitizeEmail, stripEmailHead, hasRemoteImages, blockRemoteImages, rewriteEbayImageserUrls, rewriteAnchorHrefs } from '../services/emailSanitizer.js';
 import { snippetFromBody, decodeMimeWords, parseRawHeaders, buildHeadersFromMessage } from '../services/messageParser.js';
 import { resolveTrashFolder, resolveAllTrashPaths, resolveAllDraftsPaths, resolveArchiveFolder, isAllMailFolder, resolveSpamFolder, resolveAllSpamPaths, getDeleteStrategy, adjustFolderCounts, fanOutReadToSiblings, fanOutStarToSiblings, fanOutBulkReadToSiblings } from '../utils/mailUtils.js';
@@ -15,6 +18,8 @@ import { resolveAccountScope } from '../services/unifiedInbox.js';
 import { validateHost } from '../services/hostValidation.js';
 import { safeFetch } from '../services/safeFetch.js';
 import { safeFilename, attachmentDisposition } from '../utils/contentDisposition.js';
+import { tokenize, extractFlagFeatures } from '../services/spamTokenizer.js';
+import { updateIncrementalForUser } from '../services/spamModelStore.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -117,6 +122,9 @@ function snippetIsGarbled(s) {
 // and folder are captured before a move/delete can drop them; the hook swallows per-plugin
 // errors, so a completed mutation is never turned into a 500.
 function notifyMailMutation(rows, userId) {
+  for (const accountId of new Set(rows.map(m => m.account_id).filter(Boolean))) {
+    imapManager.scheduleCountRefresh?.(accountId);
+  }
   const byAccount = new Map();
   for (const m of rows) {
     if (!m.message_id) continue;
@@ -218,6 +226,7 @@ router.get('/messages/:id', async (req, res) => {
              m.date, m.snippet, m.is_read, m.is_starred,
              m.has_attachments, m.account_id, m.category, m.flags,
              m.list_unsubscribe, m.list_unsubscribe_post, m.unsubscribed_at, m.delivery_addresses,
+             m.spam_verdict, m.spam_user_override, m.spam_score_ml,
              a.name AS account_name, a.email_address AS account_email,
              a.color AS account_color
       FROM messages m
@@ -251,10 +260,11 @@ router.get('/resolve-message', async (req, res) => {
   const accountId = rawAccountId || null;
   const COLS = `m.id, m.uid, m.folder, m.message_id, m.subject,
              m.from_name, m.from_email, m.to_addresses, m.cc_addresses,
-             m.reply_to, m.in_reply_to,
+             m.reply_to, m.in_reply_to, m.thread_id,
              m.date, m.snippet, m.is_read, m.is_starred,
              m.has_attachments, m.account_id, m.category, m.flags,
              m.list_unsubscribe, m.list_unsubscribe_post, m.unsubscribed_at, m.delivery_addresses,
+             m.spam_verdict, m.spam_user_override, m.spam_score_ml,
              a.name AS account_name, a.email_address AS account_email,
              a.color AS account_color`;
   try {
@@ -323,11 +333,19 @@ router.get('/thread/:threadId', async (req, res) => {
 
     // Show all non-deleted messages in the thread regardless of folder. This includes
     // Sent replies (which have distinct message_ids) alongside received messages.
-    // DISTINCT ON (m.message_id) deduplicates the same message appearing in multiple
-    // folders (e.g. Gmail's All Mail), preferring the INBOX copy.
+    // DISTINCT ON deduplicates the same message appearing in multiple folders (e.g. Gmail's
+    // All Mail), preferring the INBOX copy.
+    //
+    // The key is scoped to the account. One email delivered to two connected accounts is two
+    // separate mailbox items sharing a Message-ID, and a bare message_id key dropped one of
+    // them: the copy vanished from the conversation as well as from the grouped list, so in
+    // conversation mode it was not reachable anywhere in the UI (#476). Thunderbird puts both
+    // copies in the one thread here, keyed by Message-ID and explicitly folder- and
+    // account-agnostic for THREADING while still listing each copy, which is the behavior this
+    // matches. Same-account duplicates (All Mail, the Sent twin) still collapse.
     const result = await query(`
       WITH deduped AS (
-        SELECT DISTINCT ON (m.message_id)
+        SELECT DISTINCT ON (m.account_id, m.message_id)
                m.id, m.uid, m.folder, m.message_id, m.thread_id, m.subject,
                m.from_name, m.from_email, m.to_addresses, m.cc_addresses,
                m.reply_to, m.in_reply_to,
@@ -340,11 +358,14 @@ router.get('/thread/:threadId', async (req, res) => {
         WHERE m.is_deleted = false
           AND m.account_id = ANY($1)
           AND m.thread_key = $2
-        ORDER BY m.message_id,
+        ORDER BY m.account_id,
+                 m.message_id,
                  CASE WHEN m.folder = 'INBOX' THEN 0 ELSE 1 END,
                  m.date ASC
       )
-      SELECT * FROM deduped ORDER BY date ASC
+      -- account_id, id break the tie: two accounts' copies of one email carry the same Date,
+      -- so date alone would order them arbitrarily between requests.
+      SELECT * FROM deduped ORDER BY date ASC, account_id, id
     `, [accountIds, threadId]);
 
     res.json({ messages: result.rows });
@@ -354,30 +375,27 @@ router.get('/thread/:threadId', async (req, res) => {
   }
 });
 
-// Unread counts
-// Reads directly from the messages table (source of truth) rather than the
-// folders.unread_count cache. The cache is updated at the START of each sync
-// cycle, before new messages are inserted, so it lags by one full sync interval
-// (~60 s) after new mail arrives. Querying messages directly means the count
-// returned immediately after the new_messages WS event is always authoritative.
+// Counts are snapshots independently measured on the IMAP server, never cache tallies.
 router.get('/unread-counts', async (req, res) => {
-  const result = await query(`
-    SELECT m.account_id, a.include_in_unified_inbox, COUNT(*) AS count
-    FROM messages m
-    JOIN email_accounts a ON a.id = m.account_id
-    WHERE a.user_id = $1 AND a.enabled = true
-      AND m.folder = 'INBOX' AND m.is_read = false AND m.is_deleted = false
-    GROUP BY m.account_id, a.include_in_unified_inbox
-  `, [req.session.userId]);
-
-  const byAccount = {};
-  let total = 0;
+  const result = await query(`SELECT a.id AS account_id, a.include_in_unified_inbox,
+      f.server_unread_count AS count, f.server_total_count, f.server_counts_at, f.server_count_revision, f.status_attempt_revision, f.status_error
+    FROM email_accounts a LEFT JOIN folders f ON f.account_id=a.id AND f.path='INBOX'
+    WHERE a.user_id=$1 AND a.enabled`, [req.session.userId]);
+  const byAccount = {}, snapshots = {};
+  let total = 0, complete = true;
   for (const row of result.rows) {
-    byAccount[row.account_id] = parseInt(row.count);
-    if (row.include_in_unified_inbox !== false) total += parseInt(row.count);
+    const known = row.count != null && row.server_counts_at != null;
+    const count = known ? Number(row.count) : null;
+    byAccount[row.account_id] = count;
+    const stale = !known || !!row.status_error || Date.now() - new Date(row.server_counts_at).getTime() > STATUS_STALE_MS;
+    snapshots[row.account_id] = { totalCount: known && row.server_total_count != null ? Number(row.server_total_count) : null, revision: row.server_count_revision || '0', attemptRevision: row.status_attempt_revision || row.server_count_revision || '0', observedAt: row.server_counts_at || null, stale, known };
+    if (row.include_in_unified_inbox !== false) {
+      if (known) total += count;
+      if (stale) complete = false;
+    }
   }
   res.set('Cache-Control', 'no-store');
-  res.json({ total, byAccount });
+  res.json({ total, byAccount, snapshots, complete });
 });
 
 // Hard cap on a live IMAP body fetch. Connection acquisition is already bounded at 30s
@@ -533,6 +551,24 @@ router.get('/messages/:id/body', async (req, res) => {
         timeout: true,
       });
     }
+    // Our own connection budget, not the provider's. Saying so beats a generic 500:
+    // the account is busy, the request is worth retrying, and nothing is broken.
+    // The provider itself is refusing additional connections (Yahoo's per-account session
+    // ceiling, #474). Distinct from poolExhausted below, which is OUR budget: here nothing
+    // MailFlow does right now will make the request succeed, so say what is happening and
+    // that MailFlow is already backing off, instead of the raw server string.
+    if (err.providerRefusing || isConnectionRefusal(msg)) {
+      return res.status(503).json({
+        error: 'The mail server is limiting connections for this account. MailFlow is backing off and will retry automatically; please try again shortly.',
+        providerLimited: true,
+      });
+    }
+    if (err.poolExhausted) {
+      return res.status(503).json({
+        error: 'This account is busy with other mail operations. Please try again in a moment.',
+        busy: true,
+      });
+    }
     res.status(500).json({ error: msg });
   }
 });
@@ -566,15 +602,20 @@ router.get('/messages/:id/headers', async (req, res) => {
       headers = buildHeadersFromMessage(message);
     }
 
+    // This exists only to REPAIR a subject we never stored, so it is gated on the stored one
+    // being missing. It used to re-derive the subject every time and hand it back
+    // unconditionally; MessageHeaderModal pushes that value up through onSubjectResolved, so
+    // any flaw in header decoding silently rewrote the list and the open message with a worse
+    // value than the one already on screen. That is how #454 became visible. Never replacing
+    // a subject we already have keeps a decoding bug contained to this modal.
     let resolvedSubject = message.subject;
-    if (headers?.trim()) {
+    const storedSubjectMissing = !message.subject || message.subject === '(no subject)';
+    if (storedSubjectMissing && headers?.trim()) {
       const parsed = parseRawHeaders(headers);
       const imapSubject = decodeMimeWords(parsed.subject || '').trim();
       if (imapSubject && imapSubject !== '(no subject)') {
         resolvedSubject = imapSubject;
-        if (!message.subject || message.subject === '(no subject)') {
-          await query('UPDATE messages SET subject = $1 WHERE id = $2', [imapSubject, id]);
-        }
+        await query('UPDATE messages SET subject = $1 WHERE id = $2', [imapSubject, id]);
       }
     }
 
@@ -910,6 +951,7 @@ router.post('/mark-all-read', async (req, res) => {
   imapManager.markAllReadImap(check.rows[0], folder).catch(err =>
     console.warn('markAllReadImap failed:', err.message)
   );
+  imapManager.scheduleCountRefresh?.(accountId);
   imapManager.broadcast({ type: 'sync_complete', accountId }, check.rows[0].user_id);
   res.json({ ok: true });
 });
@@ -923,20 +965,30 @@ router.post('/folders', async (req, res) => {
   const check = await query('SELECT * FROM email_accounts WHERE id = $1 AND user_id = $2', [accountId, req.session.userId]);
   if (!check.rows.length) return res.status(404).json({ error: 'Account not found' });
 
-  // Build path: if parentPath given, look up the delimiter used by this account's folders
-  let path = name.trim();
-  if (parentPath) {
-    const delimResult = await query('SELECT delimiter FROM folders WHERE account_id = $1 LIMIT 1', [accountId]);
-    const delim = delimResult.rows[0]?.delimiter || '/';
-    path = `${parentPath}${delim}${name.trim()}`;
-  }
+  // Join parent and leaf with '/' and let ensureFolder translate: it splits on
+  // '/' and imapflow joins the segments with the server's real hierarchy
+  // delimiter and namespace, so a parent stored in native form (INBOX.Foo)
+  // plus a new leaf lands at INBOX.Foo.Bar on a dot-delimited server. The raw
+  // mailboxCreate this replaces ignored both, so a folder created through
+  // MailFlow could be stored under a path the server never had — and creating
+  // a subfolder beneath such a ghost silently vanished on the next
+  // folder-structure sync.
+  const requested = parentPath ? `${parentPath}/${name.trim()}` : name.trim();
 
   try {
-    await imapManager.createFolder(check.rows[0], path);
+    const { path } = await imapManager.ensureFolder(check.rows[0], requested, { resolvePath: true });
+    // Store the account's delimiter too — rows inserted without one (NULL)
+    // poison later delimiter lookups for subfolder creation and rename.
+    const delimResult = await query(
+      `SELECT delimiter FROM folders
+       WHERE account_id = $1 AND delimiter IS NOT NULL AND delimiter <> ''
+       LIMIT 1`,
+      [accountId]
+    );
     await query(
-      `INSERT INTO folders (account_id, path, name) VALUES ($1, $2, $3)
+      `INSERT INTO folders (account_id, path, name, delimiter) VALUES ($1, $2, $3, $4)
        ON CONFLICT (account_id, path) DO NOTHING`,
-      [accountId, path, name.trim()]
+      [accountId, path, name.trim(), delimResult.rows[0]?.delimiter || null]
     );
     res.json({ ok: true, path });
   } catch (err) {
@@ -1155,7 +1207,7 @@ router.post('/messages/bulk-read', async (req, res) => {
       );
       results.forEach((r, i) => {
         if (r.status === 'rejected') {
-          console.error(`bulk-read IMAP ${msgs[i].id}:`, r.reason.message);
+          console.error(`bulk-read IMAP ${msgs[i].id}:`, extractImapError(r.reason));
           // Durable retry so a later flag-sync pull can't revert this message to unread.
           imapManager._enqueueFlagPush(accountId, msgs[i].id, '\\Seen', read);
         } else {
@@ -2028,6 +2080,74 @@ router.delete('/messages/:id', async (req, res) => {
 //
 // No automatic classification runs here — that ships in v0.2 (ML) and v0.3 (SA).
 
+// Helper: build the v0.2 feature payload for a messages row at mark time.
+// Shape matches spam_training_log (migration 0048) + spamModelStore inputs.
+function extractSpamFeatures(message) {
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  const attachmentNames = attachments
+    .map(a => a?.filename || a?.name)
+    .filter(Boolean)
+    .map(f => { const dot = String(f).lastIndexOf('.'); return dot > 0 ? String(f).slice(dot + 1).toLowerCase() : null; })
+    .filter(Boolean);
+
+  const msg = {
+    subject: message.subject || '',
+    body: message.body_text || '',
+    bodyHtml: message.body_html || '',
+    from: message.from_email ? `<${message.from_email}>` : null,
+    replyTo: null,
+    headers: [],
+    attachments,
+  };
+
+  return {
+    subject: msg.subject,
+    body_text: message.body_text || null,
+    body_html: message.body_html || null,
+    token_counts: countTokens(tokenize(msg)),
+    flag_features: extractFlagFeatures(msg),
+    sender_domain: message.from_email ? message.from_email.split('@').pop()?.toLowerCase() || null : null,
+    attachment_types: attachmentNames.length ? attachmentNames : null,
+  };
+}
+
+// count token occurrences into {word: n}
+function countTokens(tokens) {
+  const counts = {};
+  for (const t of tokens) counts[t] = (counts[t] || 0) + 1;
+  return counts;
+}
+
+// Log one training decision with its v0.2 features, then feed the ML model.
+async function logSpamTraining(userId, message, folder, label, features) {
+  await query(
+    `INSERT INTO spam_training_log
+       (user_id, account_id, message_id_header, message_uid, folder, label, source,
+        subject, body_text, body_html, token_counts, flag_features, sender_domain, attachment_types)
+     VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7, $8, $9, $10, $11, $12, $13)
+     ON CONFLICT DO NOTHING`,
+    [
+      userId, message.account_id, message.message_id || null, message.uid, folder, label,
+      features.subject, features.body_text, features.body_html,
+      JSON.stringify(features.token_counts), JSON.stringify(features.flag_features),
+      features.sender_domain, features.attachment_types ?? null,
+    ]
+  );
+  // Incremental training: update the user's Naive Bayes model in <1s.
+  // Non-blocking on failure — user feedback must never break the HTTP path.
+  try {
+    await updateIncrementalForUser(userId, {
+      subject: features.subject,
+      body: features.body_text || '',
+      bodyHtml: features.body_html || '',
+      from: message.from_email ? `<${message.from_email}>` : null,
+      attachments: Array.isArray(message.attachments) ? message.attachments : [],
+    }, label);
+  } catch (err) {
+    console.warn(`spam incremental training failed for user ${userId}:`, err.message);
+  }
+}
+
 // Helper: move a single message to a destination folder, update DB, log to
 // training_log, and broadcast folder_updated. Shared between /spam and /ham.
 async function moveForSpamLabel(messageId, userId, destinationFolder, label) {
@@ -2040,16 +2160,16 @@ async function moveForSpamLabel(messageId, userId, destinationFolder, label) {
   if (!result.rows.length) return { ok: false, status: 404, error: 'Message not found' };
   const message = result.rows[0];
 
+  // v0.2: extract token/flag features at mark time (Solution C, migration
+  // 0048) and feed the per-user Naive Bayes model incrementally. The stored
+  // features make the retrain path independent of message persistence.
+  const spamFeatures = extractSpamFeatures(message);
+
   // No-op: message already in the destination folder.
   if (message.folder === destinationFolder) {
     // Still record the training label so the user's intent is captured
     // (e.g. re-confirming a verdict), but skip the IMAP move.
-    await query(
-      `INSERT INTO spam_training_log
-         (user_id, account_id, message_id_header, message_uid, folder, label)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [userId, message.account_id, message.message_id, message.uid, message.folder, label]
-    );
+    await logSpamTraining(userId, message, destinationFolder, label, spamFeatures);
     await query(
       `UPDATE messages SET spam_user_override = $1, spam_verdict = $1, spam_analyzed_at = NOW() WHERE id = $2`,
       [label, messageId]
@@ -2104,11 +2224,10 @@ async function moveForSpamLabel(messageId, userId, destinationFolder, label) {
   // lives in the destination folder: on a UIDPLUS move the row was re-keyed to newUid above,
   // so message.uid (the pre-move source UID) would no longer match the messages row. Non-UIDPLUS
   // servers keep the source UID at the destination, so newUid is null there and we fall back to it.
-  await query(
-    `INSERT INTO spam_training_log
-       (user_id, account_id, message_id_header, message_uid, folder, label, source)
-     VALUES ($1, $2, $3, $4, $5, $6, 'manual')`,
-    [userId, account.id, message.message_id, newUid ?? message.uid, destinationFolder, label]
+  await logSpamTraining(
+    userId,
+    { ...message, uid: newUid ?? message.uid, account_id: account.id },
+    destinationFolder, label, spamFeatures,
   );
 
   // If folder_mappings.spam is not yet configured, learn from the discovered folder.

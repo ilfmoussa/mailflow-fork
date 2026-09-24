@@ -6,12 +6,13 @@ import { useWebSocket } from '../hooks/useWebSocket.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { LAYOUTS } from '../layouts.js';
 import { updateFaviconBadge } from '../themes.js';
+import { installResumeRefresh } from '../utils/resumeRefresh.js';
 import { shortcutBus } from '../utils/shortcutBus.js';
-import { setPending, pendingMarkReadMap, completedMarkReadMap } from '../utils/pendingReads.js';
+import { applyMarkRead } from '../utils/markRead.js';
 import { buildKeyMap, buildModKeyMap, getEffectiveShortcuts, getGroupedActions, parseModKey, modLabel, SPECIAL_KEYS, SPECIAL_KEY_LABELS } from '../utils/defaultShortcuts.js';
 import Sidebar from './Sidebar.jsx';
 import MessageList from './MessageList.jsx';
-import MessagePane from './MessagePane.jsx';
+import ReadingPane from './ReadingPane.jsx';
 import NotificationToasts from './NotificationToasts.jsx';
 import CommandPalette from './CommandPalette.jsx';
 import { usePluginSlot, PluginRuntime } from '../plugins/PluginSlot.jsx';
@@ -313,25 +314,10 @@ export default function MailApp() {
         // selectAndMarkRead — so mark it read here too. Mirrors that logic exactly,
         // including the pending-read guard that stops a concurrent sync from
         // reverting the optimistic flag. Respects the user's manual-mark preference.
-        const st = useStore.getState();
-        if (msg.is_read || st.markReadBehavior === 'manual') return;
-        st.updateMessage(msg.id, { is_read: true });
-        st.decrementUnread(msg.account_id);
-        st.adjustCategoryCount(msg.category, -1);
-        setPending(msg.id, msg.account_id);
-        api.bulkRead([msg.id], true)
-          .then(() => {
-            pendingMarkReadMap.delete(msg.id);
-            completedMarkReadMap.set(msg.id, msg.account_id);
-            setTimeout(() => completedMarkReadMap.delete(msg.id), 10000);
-          })
-          .catch(e => {
-            console.error('Deep-link markRead failed:', e.message);
-            st.updateMessage(msg.id, { is_read: false });
-            st.incrementUnread(msg.account_id);
-            st.adjustCategoryCount(msg.category, 1);
-            pendingMarkReadMap.delete(msg.id);
-          });
+        // A deep-link is an explicit open, so it marks read immediately rather than
+        // honoring markReadDelay, but it still respects the manual preference.
+        if (useStore.getState().markReadBehavior === 'manual') return;
+        applyMarkRead(msg);
       })
       .catch(err => console.warn('Deep link message not found:', err.message));
   }, [setSelectedMessage]);
@@ -438,11 +424,41 @@ export default function MailApp() {
         .then(setUnreadCounts)
         .catch(console.error);
     };
+    const refreshFolders = () => {
+      const state = useStore.getState();
+      for (const accountId of Object.keys(state.folders)) {
+        api.getFolders(accountId).then(f => useStore.getState().setFolders(accountId, f)).catch(() => {});
+      }
+    };
     refreshCounts();
-    // 5-minute fallback poll — WebSocket sync_complete events handle the common case;
-    // this covers stale counts when the WebSocket is temporarily disconnected.
-    const interval = setInterval(refreshCounts, 300000);
-    return () => clearInterval(interval);
+    // Also expire stale indicators when the socket is unavailable.
+    const interval = setInterval(() => { refreshCounts(); refreshFolders(); }, 60000);
+
+    // Resynchronise the moment the tab comes back, rather than waiting for a timer that was
+    // frozen while it was away. Without this the LIST can show a pre-sleep snapshot while the
+    // counts, which are polled and pushed from more places, are already current — so the badge
+    // says 2 and the list shows nothing unread, which reads as the unread count lying.
+    //
+    // This deliberately reuses mailflow:refresh, the signal the socket-down fallback already
+    // dispatches and MessageList already listens for, instead of adding a second reload path.
+    // What counts as a resume, and collapsing the burst of signals one resume produces, lives
+    // in utils/resumeRefresh.js with its tests.
+    const stopResume = installResumeRefresh({
+      doc: document, win: window,
+      shouldSkip: () => useStore.getState().isLocked,
+      onResync: () => {
+        refreshCounts();
+        refreshFolders();
+        window.dispatchEvent(new CustomEvent('mailflow:refresh'));
+      },
+    });
+
+    window.addEventListener('mailflow:counts_refresh', refreshCounts);
+    return () => {
+      clearInterval(interval);
+      stopResume();
+      window.removeEventListener('mailflow:counts_refresh', refreshCounts);
+    };
   }, [setAccounts, setUnreadCounts, setTodoistConnected]);
 
   // WebSocket-independent periodic refresh of the open message list, at the user's chosen sync
@@ -751,7 +767,7 @@ export default function MailApp() {
             <MessageList />
           </div>
           <div style={{ flex: 1, display: !showContacts && selectedMessageId ? 'flex' : 'none', overflow: 'hidden', height: '100%' }}>
-            <MessagePane />
+            <ReadingPane />
           </div>
         </>
       ) : (
@@ -793,7 +809,7 @@ export default function MailApp() {
                   onMouseLeave={e => { e.currentTarget.style.background = 'var(--border-subtle)'; }}
                 />
               )}
-              <MessagePane />
+              <ReadingPane />
               {/* Generic right-sidebar column, populated from the content seam above. */}
               {currentLayout.direction === 'row' && rightSidebarContent != null && (
                 <>

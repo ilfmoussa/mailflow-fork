@@ -114,6 +114,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
                m.date, m.snippet, m.is_read, m.is_starred,
                m.has_attachments, m.account_id, m.category, m.flags,
                m.list_unsubscribe, m.list_unsubscribe_post, m.delivery_addresses,
+               m.spam_verdict, m.spam_user_override, m.spam_score_ml,
                a.name  AS account_name,
                a.email_address AS account_email,
                a.color AS account_color,
@@ -133,7 +134,10 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
       ),
       thread_totals AS (
         SELECT m.thread_key AS thread_id,
-               COUNT(DISTINCT m.message_id)::int AS message_count
+               -- Per account, not per Message-ID: one email delivered to two connected
+               -- accounts is two messages in the thread (see the thread route), so the badge
+               -- has to count both or it reads 1 beside a conversation holding 2 (#476).
+               COUNT(DISTINCT (m.account_id, m.message_id))::int AS message_count
         FROM messages m
         WHERE m.account_id = ANY($${p})
           AND m.is_deleted = false
@@ -163,6 +167,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
              date, snippet, is_starred, is_read, has_attachments, account_id,
              account_name, account_email, account_color,
              category, flags, list_unsubscribe, list_unsubscribe_post, delivery_addresses,
+             spam_verdict, spam_user_override, spam_score_ml,
              message_count, unread_count,
              thread_has_contact_photo AS has_contact_photo
       FROM ranked
@@ -194,6 +199,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
            m.date, m.snippet, m.is_read, m.is_starred,
            m.has_attachments, m.account_id, m.category, m.flags,
            m.list_unsubscribe, m.list_unsubscribe_post, m.delivery_addresses,
+           m.spam_verdict, m.spam_user_override, m.spam_score_ml,
            a.name as account_name, a.email_address as account_email, a.color as account_color,
            (co.id IS NOT NULL) AS has_contact_photo
     FROM messages m

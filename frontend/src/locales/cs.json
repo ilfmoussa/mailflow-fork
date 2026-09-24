@@ -192,7 +192,8 @@
       "title": "Zpráva smazána",
       "body": "Odstraněno.",
       "failTitle": "Smazání se nezdařilo",
-      "failBody": "Zprávu se nepodařilo smazat."
+      "failBody": "Zprávu se nepodařilo smazat.",
+      "conversationTitle": "Konverzace smazána"
     },
     "bulkDeleted": {
       "title_one": "Smazána {{count}} zpráva",
@@ -241,6 +242,7 @@
     "releaseToSync": "Uvolněním synchronizujete",
     "noSearchResults": "Nebyly nalezeny žádné výsledky",
     "noSearchResultsDesc": "Žádné výsledky pro {{query}}",
+    "searchFailed": "Hledání se nezdařilo",
     "clearSearch": "Vymazat hledání",
     "searchHelp": {
       "title": "Operátory vyhledávání",
@@ -295,6 +297,13 @@
     "allowSender": "Vždy povolit od {{email}}",
     "allowDomain": "Vždy povolit z @{{domain}}",
     "downloading": "Stahování…",
+    "attachmentRisk": {
+      "block": "Nebezpečný typ souboru (.{{ext}}) – může spustit kód v počítači",
+      "warn": "Rizikový typ souboru (.{{ext}}) – může obsahovat makra nebo falešnou přihlašovací stránku",
+      "notice": "Archiv – obsah nelze zkontrolovat",
+      "doubleExt": "Skrytá přípona: .{{ext}} – skutečný typ je ten poslední",
+      "armed": "{{label}} — kliknutím znovu přesto stáhnete"
+    },
     "downloadAll": "Stáhnout vše",
     "reply": "Odpovědět",
     "replyAll": "Odpovědět všem",
@@ -322,17 +331,20 @@
       "failTitle": "Archivace se nezdařila",
       "failBody": "Zprávu se nepodařilo archivovat.",
       "noFolderTitle": "Chybí složka archivu",
-      "noFolderBody": "Pro tento účet není nastavena složka archivu. Nastavte ji v Nastavení → Účty → Mapování složek."
+      "noFolderBody": "Pro tento účet není nastavena složka archivu. Nastavte ji v Nastavení → Účty → Mapování složek.",
+      "conversationTitle": "Konverzace archivována"
     },
     "moved": {
       "title": "Zpráva přesunuta",
       "failTitle": "Přesunutí se nezdařilo",
-      "failBody": "Zprávu se nepodařilo přesunout."
+      "failBody": "Zprávu se nepodařilo přesunout.",
+      "conversationTitle": "Konverzace přesunuta"
     },
     "snoozed": {
       "title": "Zpráva odložena",
       "failTitle": "Odložení se nezdařilo",
-      "failBody": "Tuto zprávu se nepodařilo odložit."
+      "failBody": "Tuto zprávu se nepodařilo odložit.",
+      "conversationTitle": "Konverzace odložena"
     },
     "whitelistFail": {
       "title": "Předvolbu se nepodařilo uložit",
@@ -406,8 +418,11 @@
     },
     "toolbar": {
       "removeTable": "Odebrat tabulku",
+      "typography": "Formátování písma",
       "textColor": "Barva textu",
       "removeColor": "Odebrat barvu",
+      "customColor": "Vlastní barva…",
+      "noColor": "Bez barvy",
       "insertImage": "Vložit obrázek",
       "minimize": "Minimalizovat",
       "maximize": "Maximalizovat",
@@ -687,7 +702,69 @@
     "failHamTitle": "Nepodařilo se označit, že nejde o spam",
     "failBody": "Poštovní server přesunutí odmítl.",
     "failHamBody": "Poštovní server přesunutí odmítl.",
-    "failBodyBulk": "Nepodařilo se přesunout {{count}} zpráv."
+    "failBodyBulk": "Nepodařilo se přesunout {{count}} zpráv.",
+    "title": "Antispam",
+    "subtitle": "Filtr spamu s ML pro jednotlivé uživatele. Učí se z vašich ručních označení spam/není spam; nové zprávy se klasifikují automaticky, pokud je filtr pro účet zapnutý.",
+    "saved": "Nastavení uloženo",
+    "resetAllDone": "Trénovací data smazána — odstraněno {{n}} záznamů",
+    "retrainDone": "Přeškolení dokončeno — zpracováno {{n}} uživatelů",
+    "retrainBusy": "Přeučení už probíhá — dokončí se samo",
+    "statusTitle": "Stav modelu",
+    "statusHelp": "Model je určen pro jednoho uživatele a sdílí se mezi jeho účty. Při méně než 50 trénovacích záznamech se používají jen vestavěná pravidla.",
+    "statMaturity": "Vyspělost",
+    "statRecords": "Trénovací záznamy",
+    "statVersion": "Verze modelu",
+    "statLastTrained": "Naposledy trénováno",
+    "statDecay": "Okno útlumu",
+    "never": "nikdy",
+    "days": "dní",
+    "maturity": {
+      "mature": "Vyspělý",
+      "fresh": "Čerstvý",
+      "insufficient": "Nedostatečný"
+    },
+    "masterEnable": "Zapnout antispam",
+    "masterEnableHelp": "Hlavní přepínač automatické klasifikace. Každý účet má navíc vlastní přepínač.",
+    "perAccountHint": "Přepínač pro účet: Účty → vyberte účet → sekce Antispam.",
+    "thresholdsTitle": "Prahové hodnoty",
+    "thresholdsHelp": "Vyšší hodnoty znamenají méně falešných poplachů, ale propustí více spamu.",
+    "spamThreshold": "Práh spamu",
+    "autoMoveThreshold": "Práh automatického přesunu",
+    "save": "Uložit",
+    "decayTitle": "Útlum tréninku",
+    "decayHelp": "Starší trénovací data mají nižší váhu podle tohoto poločasu rozpadu (7–365 dní).",
+    "dangerTitle": "Nebezpečná zóna",
+    "retrainNow": "Přeškolit nyní",
+    "resetConfirmWarn": "Tato akce je nevratná: všechna vaše trénovací data budou smazána.",
+    "resetConfirmYes": "Ano, smazat trénovací data",
+    "resetAll": "Smazat všechna trénovací data",
+    "deletionsTitle": "Nedávná smazání",
+    "deleteScope": {
+      "per_account": "Jeden účet",
+      "all": "Všechny účty"
+    },
+    "records": "záznamů",
+    "howItWorks": "Jak to funguje: vaše ruční volby „Označit jako spam“ / „Není spam“ trénují model. Automaticky klasifikované zprávy ho nikdy nepřeškolují. Pravidla jsou vždy aktivní; ML model se přidá od 50 záznamů.",
+    "badgeLabel": "spam",
+    "badgeTitle": "Automaticky klasifikováno jako spam — kliknutím zobrazíte podrobnosti",
+    "explainTitle": "Proč bylo označeno jako spam?",
+    "explainVerdict": "Verdikt",
+    "explainMethod": "Metoda",
+    "explainConfidence": "Jistota",
+    "verdict": {
+      "spam": "Spam",
+      "ham": "Není spam",
+      "unsure": "Nejisté"
+    },
+    "method": {
+      "rules": "Pravidla",
+      "blended": "Pravidla + ML"
+    },
+    "rulesFiredTitle": "Aktivovaná pravidla",
+    "noRulesFired": "Neaktivovalo se žádné pravidlo",
+    "mlTokensTitle": "Nejvýznamnější tokeny",
+    "noMlTokens": "Žádné ML tokeny",
+    "conversationMovedToSpam": "Konverzace přesunuta do spamu"
   },
   "todoist": {
     "title": "Vytvořit úkol v Todoistu",
@@ -774,6 +851,7 @@
       "about": "O aplikaci",
       "ai": "Asistent AI",
       "aiActions": "Akce AI",
+      "antispam": "Antispam",
       "categories": "Kategorie",
       "groupAccountMail": "Účet a pošta",
       "groupDisplay": "Zobrazení",
@@ -903,6 +981,15 @@
       "categorizationSection": "Kategorizace e-mailů",
       "categorizationEnabled": "Zapnout kategorizaci Doručené pošty",
       "categorizationEnabledDesc": "Třídit příchozí e-maily do karet kategorií. Ve výchozím nastavení je vypnuto.",
+      "antispamSection": "Antispam",
+      "antispamEnabled": "Zapnout antispam pro tento účet",
+      "antispamEnabledDesc": "Příchozí zprávy se klasifikují automaticky; spam s vysokou jistotou se přesune do složky Junk.",
+      "trustedAuthservLabel": "Důvěryhodné ID Authentication-Results",
+      "trustedAuthservPlaceholder": "mx.example.com",
+      "trustedAuthservDesc": "Důvěryhodné jsou pouze hlavičky Authentication-Results zapsané tímto ID. Ponechte prázdné pro ignorování všech — nedůvěryhodná hlavička může tvrdit jakýkoli výsledek, včetně pass.",
+      "trustedAuthservDetected": "Viděno ve vašich nedávných zprávách (kliknutím použijete):",
+      "trustedAuthservDetectedNone": "Zatím žádná data — zprávy se kontrolují, jakmile je pro tento účet zapnutý antispam.",
+      "trustedAuthservWarn": "Důvěřujte pouze ID, které znáte jako přijímající server vašeho poskytovatele.",
       "enabledGlobally": "Globálně zapnuto"
     },
     "folderMappings": {
@@ -1010,6 +1097,7 @@
       "runButton": "Spustit pravidla v Doručené poště",
       "running": "Probíhá…",
       "runResult": "Hotovo — odpovídalo {{matched}} z {{processed}} zpráv",
+      "runStarted": "Běží na pozadí — po dokončení budete upozorněni",
       "runError": "Pravidla se nepodařilo spustit"
     },
     "privacy": {
@@ -1116,6 +1204,8 @@
       "threadingOffDesc": "Každá zpráva se zobrazuje samostatně",
       "threadingOn": "Zapnuto",
       "threadingOnDesc": "Odpovědi se seskupují do konverzací",
+      "threadingPane": "Podokno čtení",
+      "threadingPaneDesc": "Celá konverzace se otevře najednou",
       "composeFormat": "Formát zpráv",
       "composeRichText": "Formátovaný text",
       "composeRichTextDesc": "Odesílá HTML — podporuje formátování a stylované podpisy",
@@ -1143,9 +1233,6 @@
       "defaultMailAppError": "Prohlížeč požadavek zablokoval.",
       "markReadDelayLabel": "Prodleva",
       "markReadDelaySeconds": "{{count}} sekunda",
-      "markReadDelaySeconds_one": "{{count}} sekunda",
-      "markReadDelaySeconds_few": "{{count}} sekundy",
-      "markReadDelaySeconds_many": "{{count}} sekundy",
       "markReadDelaySeconds_other": "{{count}} sekund",
       "hoverQuickActionsMode": "Rychlé akce při najetí",
       "hoverQuickActionsOff": "Vypnuto",
@@ -1166,7 +1253,10 @@
       "gravatarOff": "Vypnuto",
       "gravatarOffDesc": "Soukromé — nikdy nekontaktuje třetí stranu.",
       "gravatarOn": "Zapnuto",
-      "gravatarOnDesc": "Načítat fotografie odesílatelů z Gravataru — sdílí hashované adresy odesílatelů s třetí stranou."
+      "gravatarOnDesc": "Načítat fotografie odesílatelů z Gravataru — sdílí hashované adresy odesílatelů s třetí stranou.",
+      "markReadDelaySeconds_one": "{{count}} sekunda",
+      "markReadDelaySeconds_few": "{{count}} sekundy",
+      "markReadDelaySeconds_many": "{{count}} sekundy"
     },
     "gtd": {
       "description": "Proměňte MailFlow v systém GTD. Zapněte jej pro jednotlivé účty a potom přiřaďte každý stav ke složce IMAP, která obsahuje jeho štítek.",
@@ -1483,6 +1573,32 @@
         "deviceCodeDeclined": "Autorizace byla zamítnuta.",
         "deviceCodeError": "Došlo k chybě. Zkuste to znovu.",
         "deviceCodeCancel": "Zrušit"
+      },
+      "google": {
+        "title": "Gmail / Google Workspace",
+        "description": "OAuth2 pro schránky Gmail a Google Workspace — nutné, pokud správce zakázal hesla aplikací",
+        "configured": "Nastaveno",
+        "notConfigured": "Nenastaveno",
+        "redirecting": "Přesměrování…",
+        "connect": "Připojit účet Google",
+        "setupTitle": "Nastavení klienta OAuth v Google Cloud",
+        "step1": "Přejděte na console.cloud.google.com a vyberte (nebo vytvořte) projekt. U domény Workspace se přihlaste účtem z této domény, aby projekt patřil organizaci",
+        "step2": "API a služby → Knihovna → povolte Gmail API",
+        "step3": "Obrazovka souhlasu OAuth → nastavte typ uživatele a přidejte rozsah https://mail.google.com/",
+        "step4": "Přihlašovací údaje → Vytvořit přihlašovací údaje → ID klienta OAuth → Webová aplikace a přidejte níže uvedené URI přesměrování",
+        "scopeNote": "https://mail.google.com/ je omezený rozsah. Zvolte typ uživatele „Interní“, pokud projekt patří organizaci Workspace: není potřeba ověření a obnovovací tokeny nevyprší. „Externí“ v režimu testování funguje okamžitě, ale Google obnovovací tokeny po 7 dnech zruší, takže účty je nutné každý týden znovu připojit.",
+        "clientId": "ID klienta",
+        "clientIdPh": "xxxxxxxx.apps.googleusercontent.com",
+        "clientSecret": "Tajný klíč klienta",
+        "clientSecretPh": "GOCSPX-…",
+        "redirectUri": "URI přesměrování",
+        "redirectUriNote": "Musí se přesně shodovat s autorizovaným URI přesměrování u klienta OAuth. Doporučeno: {{uri}}",
+        "save": "Uložit nastavení",
+        "savedNote": "Nastavení uloženo. Klikněte na „Připojit účet Google“ pro autorizaci.",
+        "connectedNote": "Účet Google byl úspěšně připojen! Zkontrolujte kartu Účty.",
+        "userNoteConfigured": "Váš správce nastavil přihlášení přes Google. Připojte níže svůj účet Gmail nebo Google Workspace.",
+        "userNoteNotConfigured": "Přihlášení přes Google zatím správce nenastavil. Požádejte prosím svého správce o jeho nastavení.",
+        "remove": "Odebrat"
       },
       "todoist": {
         "title": "Todoist",

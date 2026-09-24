@@ -1,6 +1,9 @@
 import { create } from 'zustand';
+import { resolveConversationMode, groupsMessageList, conversationModeTransition, isConversationMode } from '../utils/conversationMode.js';
 import { api } from '../utils/api.js';
-import { accountAffectsUnifiedInbox } from '../utils/unifiedInbox.js';
+import { mergeCountSnapshots, adjustCountPending, expireCountPending, settleCountPending, displayCountSnapshot, mergeFolderSnapshots } from '../utils/countSnapshots.js';
+import { resolveSelectedAccount, pruneFolders } from '../utils/accountScope.js';
+import { aiRuns } from '../utils/aiRunRegistry.js';
 import { applyTheme, applyCustomCss, getInitialTheme } from '../themes.js';
 import { applyFontSet, applyFontSize, effectiveFontSet, isRetroFont, THEME_FONT } from '../fonts.js';
 import { applyLayout, normalizeLayout } from '../layouts.js';
@@ -83,16 +86,43 @@ function readGtdCollapsedSections() {
   return { someday: true };
 }
 
+let pendingCountTimer;
+function expirePendingCounts() {
+  clearTimeout(pendingCountTimer);
+  const deadlines = Object.values(useStore.getState().pendingCounts).map(p => p.expiresAt);
+  if (!deadlines.length) { pendingCountTimer = null; return; }
+  pendingCountTimer = setTimeout(() => {
+    pendingCountTimer = null;
+    const state = useStore.getState();
+    if (state.isLocked) return;
+    const pending = expireCountPending(state.pendingCounts);
+    useStore.setState({ pendingCounts: pending,
+      unreadCounts: displayCountSnapshot(state.serverUnreadCounts, pending, state.accounts) });
+    if (Object.keys(pending).length) expirePendingCounts();
+    window.dispatchEvent(new CustomEvent('mailflow:counts_refresh'));
+  }, Math.max(1, Math.min(...deadlines) - Date.now()));
+}
+
 export const useStore = create((set, get) => ({
   // Auth
   user: null,
   setUser: (user) => {
     // On a real identity change (login, logout, account switch) drop any queued preference
     // flush so the previous user's debounce can't save into the new/absent session.
-    if (get().user?.id !== user?.id) cancelPendingPrefSave();
+    if (get().user?.id !== user?.id) {
+      cancelPendingPrefSave();
+      clearTimeout(pendingCountTimer);
+      pendingCountTimer = null;
+      // AI runs deliberately outlive the message pane, so nothing else would stop one here. A
+      // run that outlived a logout would finish and write the previous user's result into this
+      // device's cache, under their message id, for whoever signs in next.
+      aiRuns.abortAll();
+    }
     set(state => ({
       user,
       ...(state.user?.id !== user?.id ? {
+        serverUnreadCounts: { total: 0, byAccount: {}, snapshots: {} }, pendingCounts: {},
+        unreadCounts: { total: 0, byAccount: {}, snapshots: {}, complete: false },
         senderFaviconsLoaded: false,
         senderFavicons: false,
         senderFaviconsSaving: false,
@@ -130,7 +160,13 @@ export const useStore = create((set, get) => ({
       const { selectedMessageId } = get();
       if (selectedMessageId) localStorage.setItem('mailflow_locked_message', selectedMessageId);
       localStorage.setItem('mailflow_locked', '1');
+      clearTimeout(pendingCountTimer);
+      pendingCountTimer = null;
+      // Same reasoning as an identity change: locking is the user stepping away, and a result
+      // landing in the cache behind the lock screen is the thing the lock exists to prevent.
+      aiRuns.abortAll();
       set({
+        serverUnreadCounts: { total: 0, byAccount: {}, snapshots: {} }, pendingCounts: {},
         isLocked: true,
         messages: [], searchResults: [], searchQuery: '',
         accounts: [], accountsReady: false,
@@ -164,10 +200,29 @@ export const useStore = create((set, get) => ({
   // Accounts
   accounts: [],
   accountsReady: false, // true once the initial getAccounts() call has resolved
-  setAccounts: (accounts) => set({ accounts, accountsReady: true }),
-  updateAccount: (id, updates) => set(state => ({
-    accounts: state.accounts.map(a => a.id === id ? { ...a, ...updates } : a)
-  })),
+  setAccounts: (accounts) => {
+    // Every refresh of the account list is also the moment to notice that the selected
+    // account has been deleted. Without this the client stays pinned to a dead id forever,
+    // because localStorage restores it on every load. See utils/accountScope.js.
+    const previous = get().selectedAccountId;
+    const selectedAccountId = resolveSelectedAccount(accounts, previous);
+    const reselected = selectedAccountId !== previous;
+    if (reselected) {
+      // Mirror setSelectedAccount's persistence so the fallback survives a reload.
+      localStorage.setItem('mailflow_selected_account', '');
+      localStorage.setItem('mailflow_selected_folder', 'INBOX');
+    }
+    set(state => ({
+      accounts, accountsReady: true, selectedAccountId,
+      ...(reselected ? { selectedFolder: 'INBOX' } : {}),
+      folders: pruneFolders(state.folders, accounts),
+      unreadCounts: displayCountSnapshot(state.serverUnreadCounts, state.pendingCounts, accounts),
+    }));
+  },
+  updateAccount: (id, updates) => set(state => {
+    const accounts = state.accounts.map(a => a.id === id ? { ...a, ...updates } : a);
+    return { accounts, unreadCounts: displayCountSnapshot(state.serverUnreadCounts, state.pendingCounts, accounts) };
+  }),
 
   // Navigation
   selectedAccountId: localStorage.getItem('mailflow_selected_account') || null, // '' stored as null
@@ -204,10 +259,11 @@ export const useStore = create((set, get) => ({
 
   // Messages
   messages: [],
-  // Dedupe by stable identity on every raw list load: the same email can arrive as two rows
-  // (same message delivered to two unified accounts, or a received copy + its Sent twin) and
-  // must render once, matching isSelectedRow's identity model (#378). appendMessages/restore
-  // dedupe on their own paths; this covers the initial/refresh/page loads that replace wholesale.
+  // Dedupe by delivery on every raw list load: one email can arrive as two rows (a received copy
+  // plus its Sent twin, or an INBOX copy plus its label-folder copy) and must render once,
+  // matching isSelectedRow's identity model (#378). Copies in two different accounts are separate
+  // mail and both render (#476). appendMessages/restore dedupe on their own paths; this covers the
+  // initial/refresh/page loads that replace wholesale.
   setMessages: (messages) => set({ messages: dedupeByIdentity(messages) }),
   appendMessages: (newMessages) => set(state => {
     // Merge by stable identity (Message-ID when present, else id): a same-id row is dropped so the
@@ -285,49 +341,41 @@ export const useStore = create((set, get) => ({
   lastViewedMessageId: null,
   setSelectedMessage: (id) => set(id ? { selectedMessageId: id, lastViewedMessageId: id } : { selectedMessageId: null }),
 
-  // Unread counts
-  unreadCounts: { total: 0, byAccount: {} },
-  setUnreadCounts: (counts) => set({ unreadCounts: counts }),
-  decrementUnread: (accountId, count = 1) => set(state => {
-    const byAccount = { ...state.unreadCounts.byAccount };
-    byAccount[accountId] = Math.max(0, (byAccount[accountId] || 0) - count);
-    const total = accountAffectsUnifiedInbox(state.accounts, accountId)
-      ? Math.max(0, state.unreadCounts.total - count)
-      : state.unreadCounts.total;
-    return { unreadCounts: { total, byAccount } };
+  // Server snapshots are retained separately from a bounded optimistic window.
+  serverUnreadCounts: { total: 0, byAccount: {}, snapshots: {} },
+  pendingCounts: {},
+  unreadCounts: { total: 0, byAccount: {}, snapshots: {}, complete: false },
+  setUnreadCounts: (counts) => set(state => {
+    if (state.isLocked) return {};
+    const server = mergeCountSnapshots(state.serverUnreadCounts, counts);
+    // Retire windows the server has now had a chance to observe, rather than waiting for the
+    // backstop to expire them: the timer alone reverted the badge ~1-2s before the replacement
+    // observation landed, which read as the count bouncing back on every read or move.
+    const pending = settleCountPending(state.pendingCounts, server);
+    if (!Object.keys(pending).length) { clearTimeout(pendingCountTimer); pendingCountTimer = null; }
+    return { serverUnreadCounts: server, pendingCounts: pending,
+      unreadCounts: displayCountSnapshot(server, pending, state.accounts) };
   }),
-  incrementUnread: (accountId, count = 1) => set(state => {
-    const byAccount = { ...state.unreadCounts.byAccount };
-    byAccount[accountId] = (byAccount[accountId] || 0) + count;
-    const total = accountAffectsUnifiedInbox(state.accounts, accountId)
-      ? state.unreadCounts.total + count
-      : state.unreadCounts.total;
-    return { unreadCounts: { total, byAccount } };
-  }),
-
-  // Folders
-  folders: {}, // accountId -> folders[]
-  setFolders: (accountId, folders) => set(state => ({
-    folders: { ...state.folders, [accountId]: folders }
-  })),
-  // Increment/decrement the unread_count of a single folder in one account's
-  // list. Used for optimistic UI updates when marking messages as read/spam/ham
-  // so the sidebar badge updates without waiting for a full folder sync.
-  // We clamp at 0 to avoid negative counters when the optimistic guess was off.
-  adjustFolderUnread: (accountId, folderPath, delta) => set(state => {
-    const accountFolders = state.folders[accountId];
-    if (!accountFolders) return {};
-    let changed = false;
-    const next = accountFolders.map(f => {
-      if (f.path === folderPath && Number.isFinite(f.unread_count)) {
-        const updated = Math.max(0, f.unread_count + delta);
-        if (updated !== f.unread_count) { changed = true; return { ...f, unread_count: updated }; }
-      }
-      return f;
+  adjustUnread: (accountId, delta) => {
+    set(state => {
+      if (state.isLocked) return {};
+      const displayed = displayCountSnapshot(state.serverUnreadCounts, state.pendingCounts, state.accounts);
+      const pending = adjustCountPending(state.pendingCounts, displayed, accountId, delta);
+      return { pendingCounts: pending,
+        unreadCounts: displayCountSnapshot(state.serverUnreadCounts, pending, state.accounts) };
     });
-    if (!changed) return {};
-    return { folders: { ...state.folders, [accountId]: next } };
-  }),
+    // Do not reset this timer on subsequent clicks: continuous activity cannot freeze counts.
+    if (!pendingCountTimer) expirePendingCounts();
+  },
+  decrementUnread: (accountId, count = 1) => get().adjustUnread(accountId, -count),
+  incrementUnread: (accountId, count = 1) => get().adjustUnread(accountId, count),
+
+  // Folder badges always show observed server values. Row-level read/move optimism
+  // remains immediate; aggregate thread estimates must not overwrite these snapshots.
+  folders: {},
+  setFolders: (accountId, folders) => set(state => state.isLocked ? {} : ({
+    folders: { ...state.folders, [accountId]: mergeFolderSnapshots(state.folders[accountId], folders) }
+  })),
 
   // UI state
   sidebarCollapsed: localStorage.getItem('mailflow_sidebar_collapsed') === 'true',
@@ -532,12 +580,33 @@ export const useStore = create((set, get) => ({
     schedulePrefSave({ language: lng });
   },
 
-  // Threaded view
-  threadedView: localStorage.getItem('mailflow_threaded_view') === 'true',
+  // How conversations are shown: 'off', 'list' (threads expand inline in the list) or
+  // 'pane' (a selected row opens the whole conversation in the reading area).
+  //
+  // threadedView is kept as a derived flag rather than a second source of truth: it is what
+  // the list-loading code already asks for when deciding to request threaded results, and
+  // both grouping modes want that. Deriving it means none of those call sites change, and an
+  // install that only ever knew the old boolean keeps working (resolveConversationMode
+  // migrates it).
+  conversationMode: resolveConversationMode({
+    conversationMode: localStorage.getItem('mailflow_conversation_mode'),
+    threadedView: localStorage.getItem('mailflow_threaded_view') === 'true',
+  }),
+  threadedView: groupsMessageList(resolveConversationMode({
+    conversationMode: localStorage.getItem('mailflow_conversation_mode'),
+    threadedView: localStorage.getItem('mailflow_threaded_view') === 'true',
+  })),
+  setConversationMode: (mode) => {
+    const next = conversationModeTransition(mode, get().conversationMode);
+    if (!next) return;
+    localStorage.setItem('mailflow_conversation_mode', next.conversationMode);
+    localStorage.setItem('mailflow_threaded_view', String(groupsMessageList(next.conversationMode)));
+    set({ ...next, threadedView: groupsMessageList(next.conversationMode) });
+    schedulePrefSave({ conversationMode: next.conversationMode, threadedView: groupsMessageList(next.conversationMode) });
+  },
   setThreadedView: (val) => {
-    localStorage.setItem('mailflow_threaded_view', String(val));
-    set({ threadedView: val, expandedThreadId: null, threadMessages: {} });
-    schedulePrefSave({ threadedView: val });
+    // Retained for callers that still speak the old boolean.
+    get().setConversationMode(val ? 'list' : 'off');
   },
 
   // Compose format
@@ -1112,9 +1181,11 @@ export const useStore = create((set, get) => ({
         set({ language: prefs.language });
         i18n.changeLanguage(prefs.language);
       }
-      if (typeof prefs.threadedView === 'boolean') {
-        localStorage.setItem('mailflow_threaded_view', String(prefs.threadedView));
-        set({ threadedView: prefs.threadedView });
+      if (isConversationMode(prefs.conversationMode) || typeof prefs.threadedView === 'boolean') {
+        const mode = resolveConversationMode(prefs);
+        localStorage.setItem('mailflow_conversation_mode', mode);
+        localStorage.setItem('mailflow_threaded_view', String(groupsMessageList(mode)));
+        set({ conversationMode: mode, threadedView: groupsMessageList(mode) });
       }
       if (typeof prefs.plaintextEmail === 'boolean') {
         localStorage.setItem('mailflow_plaintext_email', String(prefs.plaintextEmail));
@@ -1202,10 +1273,21 @@ export const useStore = create((set, get) => ({
 // a state field, so it stays in sync with the list automatically; returns a primitive so a
 // useStore(selectSelectedMessageMid) subscription only re-renders when the value changes.
 export function selectSelectedMessageMid(s) {
+  return findSelectedMessage(s)?.message_id ?? null;
+}
+
+// The selected message's account, the companion to selectSelectedMessageMid. isSelectedRow needs
+// both to scope an identity match to one account, so that two accounts' copies of one email
+// (separate rows since #476) do not highlight together. Also a primitive, for the same reason.
+export function selectSelectedMessageAccountId(s) {
+  return findSelectedMessage(s)?.account_id ?? null;
+}
+
+function findSelectedMessage(s) {
   const id = s.selectedMessageId;
   if (id == null) return null;
   const pool = s.searchQuery?.trim() ? s.searchResults : s.messages;
-  const msg = pool.find(m => m.id === id)
-    ?? Object.values(s.threadMessages).flat().find(m => m.id === id);
-  return msg?.message_id ?? null;
+  return pool.find(m => m.id === id)
+    ?? Object.values(s.threadMessages).flat().find(m => m.id === id)
+    ?? null;
 }

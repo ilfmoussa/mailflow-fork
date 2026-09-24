@@ -6,6 +6,8 @@ import { api } from '../utils/api.js';
 import { getContextMenuPolicy, resolveContextMenuMessage } from '../utils/contextMenuPolicy.js';
 import { usePluginCollected } from '../plugins/PluginSlot.jsx';
 import MessageHeaderModal from './MessageHeaderModal.jsx';
+import FolderPathLabel from './FolderPathLabel.jsx';
+import { folderMatchesQuery } from '../utils/folderDisplay.js';
 import { useUiScale, descale } from '../hooks/useUiScale.js';
 import { useMobile } from '../hooks/useMobile.js';
 
@@ -17,7 +19,7 @@ const SPAM_NAME_RE = /(spam|junk|bulk|indesiderata|spamverdacht|courrier\s*ind|p
 // ─── Context Menu ─────────────────────────────────────────────────────────────
 const CATEGORIES = ['primary', 'newsletter', 'promotion', 'automated', 'social'];
 
-export default function ContextMenu({ x, y, message, onClose, onAction, defaultMoveView = false, variant = 'inbox', selectedText = '' }) {
+export default function ContextMenu({ x, y, message, onClose, onAction, defaultMoveView = false, defaultSnoozeView = false, variant = 'inbox', selectedText = '' }) {
   const { t } = useTranslation();
   const uiScale = useUiScale();
   const isMobile = useMobile();
@@ -40,7 +42,7 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
   const [moveView, setMoveView] = useState(defaultMoveView);
   const [moveFolders, setMoveFolders] = useState(null);
   const [moveFoldersLoading, setMoveFoldersLoading] = useState(defaultMoveView);
-  const [snoozeView, setSnoozeView] = useState(false);
+  const [snoozeView, setSnoozeView] = useState(defaultSnoozeView);
   const [customSnoozeView, setCustomSnoozeView] = useState(false);
   const [customDate, setCustomDate] = useState('');
   const [customTime, setCustomTime] = useState('09:00');
@@ -630,7 +632,7 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
                 const searchQuery = folderSearch.trim().toLowerCase();
                 if (searchQuery) {
                   const filtered = (moveFolders || [])
-                    .filter(f => f.path !== message.folder && f.name.toLowerCase().includes(searchQuery));
+                    .filter(f => f.path !== message.folder && folderMatchesQuery(f, searchQuery));
                   return filtered.length === 0 ? (
                     <div style={{ padding: '12px 14px', color: 'var(--text-tertiary)', fontSize: 12 }}>
                       {t('contextMenu.folders.empty')}
@@ -800,9 +802,7 @@ function FolderMenuItem({ folder, onClick }) {
       }}
     >
       <span style={{ flexShrink: 0, color: 'var(--text-tertiary)', display: 'flex' }}>{icon}</span>
-      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {folder.name || folder.path}
-      </span>
+      <FolderPathLabel folder={folder} />
     </div>
   );
 }
