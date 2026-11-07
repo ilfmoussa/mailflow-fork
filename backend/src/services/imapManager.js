@@ -2902,8 +2902,6 @@ export class ImapManager {
     const uids    = flagsToUpdate.map(f => f.uid);
     const reads   = flagsToUpdate.map(f => f.isRead);
     const starred = flagsToUpdate.map(f => f.isStarred);
-    const allFlags = flagsToUpdate.map(f => f.allFlags ? JSON.stringify(f.allFlags) : null);
-    const hasAllFlags = allFlags.some(f => f !== null);
     const result = await query(`
       UPDATE messages SET
         is_read = CASE
@@ -2918,12 +2916,10 @@ export class ImapManager {
           THEN messages.is_starred
           ELSE updates.is_starred
         END
-        ${hasAllFlags ? `, flags = CASE WHEN updates.all_flags IS NOT NULL THEN updates.all_flags ELSE messages.flags END` : ''}
       FROM (
         SELECT unnest($1::bigint[])  AS uid,
                unnest($2::boolean[]) AS is_read,
                unnest($3::boolean[]) AS is_starred
-               ${hasAllFlags ? `, unnest($6::jsonb[]) AS all_flags` : ''}
       ) AS updates
       WHERE messages.account_id = $4
         AND messages.folder = $5
@@ -2937,11 +2933,8 @@ export class ImapManager {
             messages.read_changed_at IS NULL
             OR NOW() - messages.read_changed_at >= interval '30 seconds'
           ) AND messages.is_read != updates.is_read
-          ${hasAllFlags ? `OR messages.flags IS DISTINCT FROM updates.all_flags` : ''}
         )`,
-      hasAllFlags
-        ? [uids, reads, starred, account.id, folder, allFlags]
-        : [uids, reads, starred, account.id, folder]
+      [uids, reads, starred, account.id, folder]
     );
     return result.rowCount;
   }
@@ -2982,7 +2975,6 @@ export class ImapManager {
               uid: msg.uid,
               isRead: msg.flags.has('\\Seen'),
               isStarred: msg.flags.has('\\Flagged'),
-              allFlags: [...msg.flags],
             });
           }
 
@@ -3835,7 +3827,7 @@ export class ImapManager {
           try {
             const scan = (async () => {
               for await (const msg of client.fetch(`${deltaLow}:*`, { uid: true, flags: true }, { uid: true, changedSince: BigInt(storedModseq) })) {
-                flagsToUpdate.push({ uid: msg.uid, isRead: msg.flags.has('\\Seen'), isStarred: msg.flags.has('\\Flagged'), allFlags: [...msg.flags] });
+                flagsToUpdate.push({ uid: msg.uid, isRead: msg.flags.has('\\Seen'), isStarred: msg.flags.has('\\Flagged') });
               }
             })();
             // If the timeout wins the race, the fetch keeps running until ImapFlow's commandTimeout

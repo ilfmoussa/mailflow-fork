@@ -130,7 +130,6 @@ export default function MessageList() {
     markReadBehavior, markReadDelay,
     searchAllFolders,
     activeGtdTab, setActiveGtdTab, gtdSections, enabledPlugins,
-    selectedTag,
     openMessageWindow,
   } = useStore();
   // GTD's UI surfaces (pills, rail, per-row "done") gate on the GTD plugin being activated for the
@@ -408,7 +407,6 @@ export default function MessageList() {
         if (unreadOnly) params.unreadOnly = 'true';
         if (threadedView) params.threaded = 'true';
         if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
-        if (selectedTag) params.tag = selectedTag;
         await refreshRequestRef.current.run(
           () => api.getMessages(params),
           (data) => {
@@ -451,7 +449,7 @@ export default function MessageList() {
     };
     run();
     return () => { cancelled = true; };
-  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, scrollMode, accountsReady, unifiedInboxAccountKey, messagesRefreshToken, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, selectedTag, applyReadGuard, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
+  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, scrollMode, accountsReady, unifiedInboxAccountKey, messagesRefreshToken, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, applyReadGuard, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
 
   // Load next page (called by scroll or button)
   const loadMore = useCallback(async () => {
@@ -468,8 +466,6 @@ export default function MessageList() {
       if (unreadOnly) params.unreadOnly = 'true';
       if (useStore.getState().threadedView) params.threaded = 'true';
       if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
-      const curTag = useStore.getState().selectedTag;
-      if (curTag) params.tag = curTag;
       const data = await api.getMessages(params);
       appendMessages(applyReadGuard(data.messages));
       setMessagesOffset(currentOffset + data.messages.length);
@@ -502,7 +498,6 @@ export default function MessageList() {
         if (unreadOnly) params.unreadOnly = 'true';
         if (state.threadedView) params.threaded = 'true';
         if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
-        if (state.selectedTag) params.tag = state.selectedTag;
         await refreshRequestRef.current.run(
           () => api.getMessages(params),
           (data) => {
@@ -670,7 +665,6 @@ export default function MessageList() {
       if (unreadOnly) params.unreadOnly = 'true';
       if (threadedView) params.threaded = 'true';
       if (selectedFolder === 'INBOX' && (categorizationEnabled || selectedAccount?.categorization_enabled)) params.category = activeCategory;
-      if (selectedTag) params.tag = selectedTag;
       await refreshRequestRef.current.run(
         () => api.getMessages(params),
         (data) => {
@@ -687,7 +681,7 @@ export default function MessageList() {
     } finally {
       setLoadingMessages(false);
     }
-  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, loadingMessages, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, selectedTag, applyReadGuard, setExpandedThreadId, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
+  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, loadingMessages, threadedView, categorizationEnabled, selectedAccount?.categorization_enabled, applyReadGuard, setExpandedThreadId, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
 
   const handleSync = async () => {
     if (syncing) return;
@@ -4397,27 +4391,6 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
             </span>
             <SpamBadge message={message} onClick={onExplainSpam} />
           </div>
-          {/* Tag badges */}
-          {(() => {
-            const tags = (message.flags || []).filter(f => !f.startsWith('\\') && !f.startsWith('$') && !/^(Junk|JunkRecorded|NonJunk|NotJunk|MDNSent|Forwarded)$/i.test(f));
-            if (!tags.length) return null;
-            return (
-              <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '2px', marginBottom: '2px' }}>
-                {tags.map(tag => (
-                  <span key={tag} style={{
-                    fontSize: '10px',
-                    padding: '1px 6px',
-                    borderRadius: '3px',
-                    backgroundColor: 'var(--tag-bg, rgba(99, 102, 241, 0.15))',
-                    color: 'var(--tag-color, rgb(99, 102, 241))',
-                    fontWeight: 500,
-                    lineHeight: '16px',
-                    whiteSpace: 'nowrap',
-                  }}>{tag}</span>
-                ))}
-              </div>
-            );
-          })()}
           {/* Row 3: snippet */}
         {showMessagePreviews && (
           <div style={{
@@ -4715,29 +4688,6 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
           </span>
           <SpamBadge message={message} onClick={onExplainSpam} />
         </div>
-
-        {/* Tag badges */}
-        {(() => {
-          const systemFlags = new Set(['\\Seen', '\\Flagged', '\\Answered', '\\Draft', '\\Deleted', '\\Recent', '\\*']);
-          const tags = (message.flags || []).filter(f => !systemFlags.has(f) && !f.startsWith('$rule_'));
-          if (!tags.length) return null;
-          return (
-            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '2px', marginBottom: '2px' }}>
-              {tags.map(tag => (
-                <span key={tag} style={{
-                  fontSize: '10px',
-                  padding: '1px 6px',
-                  borderRadius: '3px',
-                  backgroundColor: 'var(--tag-bg, rgba(99, 102, 241, 0.15))',
-                  color: 'var(--tag-color, rgb(99, 102, 241))',
-                  fontWeight: 500,
-                  lineHeight: '16px',
-                  whiteSpace: 'nowrap',
-                }}>{tag}</span>
-              ))}
-            </div>
-          );
-        })()}
 
         {/* Row 3: Snippet */}
       {showMessagePreviews && (

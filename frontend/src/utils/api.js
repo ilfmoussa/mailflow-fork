@@ -379,11 +379,6 @@ export const api = {
     },
   },
 
-  getTags: (accountId) => {
-    const params = accountId ? `?accountId=${accountId}` : '';
-    return request('GET', `/mail/tags${params}`);
-  },
-
   // Category counts for inbox tab badges
   getCategoryCounts: (params) => {
     const qs = new URLSearchParams(params || {}).toString();
