@@ -1,8 +1,11 @@
 import { create } from 'zustand';
 import { resolveConversationMode, groupsMessageList, conversationModeTransition, isConversationMode } from '../utils/conversationMode.js';
+import { applyMessageUpdate } from '../utils/readState.js';
 import { api } from '../utils/api.js';
+import { signOut as signOutAndLeave } from '../utils/signOut.js';
 import { mergeCountSnapshots, adjustCountPending, expireCountPending, settleCountPending, displayCountSnapshot, mergeFolderSnapshots } from '../utils/countSnapshots.js';
 import { resolveSelectedAccount, pruneFolders } from '../utils/accountScope.js';
+import { UNDO_COMMIT_DELAY_MS } from '../utils/undoableAction.js';
 import { aiRuns } from '../utils/aiRunRegistry.js';
 import { applyTheme, applyCustomCss, getInitialTheme } from '../themes.js';
 import { applyFontSet, applyFontSize, effectiveFontSet, isRetroFont, THEME_FONT } from '../fonts.js';
@@ -18,6 +21,7 @@ import {
   missingByIdentity,
 } from '../utils/gtd.js';
 import { applyGtdRemovalGuard } from '../utils/pendingGtdRemovals.js';
+import { DEFAULT_HOVER_ACTIONS, sanitizeHoverActionSet } from '../utils/hoverActions.js';
 import { clampRightSidebarWidth } from '../utils/rightSidebar.js';
 import {
   cacheFolderOrderFromPreferences,
@@ -25,8 +29,9 @@ import {
   readFolderOrder,
 } from './folderOrder.js';
 import { removeThreadCacheEntry } from '../utils/threadedArchive.js';
-import i18n from '../i18n.js';
+import i18n, { initialLanguage } from '../i18n.js';
 import { createPrefSaveQueue } from '../utils/prefSaveQueue.js';
+import { compareListOrder, isDefaultListOrder, listOrderFor, listSortKey } from '../utils/listSort.js';
 
 // Accumulate rapid preference changes and flush at most once per second. The queue itself
 // lives in prefSaveQueue.js so its behaviour is testable without a network or a DOM.
@@ -87,6 +92,12 @@ function readGtdCollapsedSections() {
 }
 
 let pendingCountTimer;
+
+// The Scheduled view's state (#543), cleared with the user's other mail state on a sign-out or
+// a lock: subjects and recipients are the user's content.
+const SCHEDULED_RESET = {
+  scheduledCount: 0, scheduledAttention: 0, scheduledList: null, scheduledSummaries: {}, scheduledHighlight: null,
+};
 function expirePendingCounts() {
   clearTimeout(pendingCountTimer);
   const deadlines = Object.values(useStore.getState().pendingCounts).map(p => p.expiresAt);
@@ -103,6 +114,20 @@ function expirePendingCounts() {
   }, Math.max(1, Math.min(...deadlines) - Date.now()));
 }
 
+// The list a message was taken out of, by id, until it is put back (#630). An Undo, or a failed
+// request, puts messages back into whatever list is showing; after the reader moved to another
+// folder or account, that put them into a list they don't belong to. They are put back only while
+// the list they left is still the one showing; otherwise that list loads them again when reopened.
+const removedFromView = new Map();
+const listViewOf = state => JSON.stringify([state.selectedAccountId ?? null, state.selectedFolder ?? null,
+  String(state.searchQuery || '').trim(), Boolean(state.searchAllFolders), state.activeGtdTab ?? null, Boolean(state.threadedView),
+  listOrderFor(state.listSort, state.selectedAccountId, state.selectedFolder), state.listFilter ?? null]);
+function noteRemoved(state, ids) {
+  if (removedFromView.size > 5000) removedFromView.clear();
+  const view = listViewOf(state);
+  for (const id of ids) removedFromView.set(id, view);
+}
+
 export const useStore = create((set, get) => ({
   // Auth
   user: null,
@@ -117,19 +142,66 @@ export const useStore = create((set, get) => ({
       // run that outlived a logout would finish and write the previous user's result into this
       // device's cache, under their message id, for whoever signs in next.
       aiRuns.abortAll();
+      // The message remembered for the lock screen is the leaving user's too.
+      if (get().user) localStorage.removeItem('mailflow_locked_message');
     }
     set(state => ({
       user,
       ...(state.user?.id !== user?.id ? {
         serverUnreadCounts: { total: 0, byAccount: {}, snapshots: {} }, pendingCounts: {},
         unreadCounts: { total: 0, byAccount: {}, snapshots: {}, complete: false },
+        snoozedCount: 0,
+        ...SCHEDULED_RESET,
         senderFaviconsLoaded: false,
         senderFavicons: false,
         senderFaviconsSaving: false,
       } : {}),
+      // An expired session signs out without reloading the page. Without this, the next user
+      // to sign in here would see the previous user's mail and open compose, and would have
+      // the previous user's settings until loadPreferences replaced them, or for the whole
+      // session where the new user has never saved their own. Only when a signed-in user
+      // leaves: a cold load has nothing to clear, and clearing there would drop the reading
+      // preferences seeded from localStorage until loadPreferences ran.
+      ...(state.user && state.user.id !== user?.id ? {
+        messages: [], searchResults: [], searchQuery: '', selectedMessageId: null,
+        threadMessages: {}, expandedThreadId: null,
+        accounts: [], accountsReady: false, folders: {},
+        notifications: [], backfillProgress: {},
+        gtdSections: null, categoryCounts: {}, categoryTotals: {}, activeGtdTab: null,
+        // Reply-draft lookups and handoffs still in flight stop on the user id, so the
+        // revision need not move.
+        replyDrafts: {},
+        composing: false, composeData: null, prepareComposeSwitch: null, messageWindows: [],
+        enabledPlugins: [], autoLockMinutes: 0, blockRemoteImages: true,
+        imageWhitelist: { addresses: [], domains: [] }, shortcuts: {}, aiActions: null,
+        hiddenFolders: {}, categorizationEnabled: false, gtdPetSlug: null,
+        autoOpenReplyDrafts: false, afterRemove: 'next', darkEmailBodies: true,
+        // Folder shortcuts name the previous user's accounts and folders. Left in place, the
+        // next user's first favorite saved them into that user's own preferences.
+        favoriteFolders: [], recentFolders: [], defaultSender: '', listSort: {},
+        collapsedFolders: [], expandedAccounts: {},
+      } : {}),
     }));
   },
   updateUser: (updates) => set(state => ({ user: state.user ? { ...state.user, ...updates } : state.user })),
+  // The sidebar and the lock screen sign out here, through the shared helper (#523, #310).
+  signOut: async () => {
+    // Before the request, not after it: if the page reloads while the request is out and the
+    // server did sign out, the next load clears the lock with no user signed in, which reopens
+    // this message for whoever signs in next.
+    localStorage.removeItem('mailflow_locked_message');
+    let loggedOut = false;
+    await signOutAndLeave({
+      setUser: get().setUser,
+      logout: async () => { const res = await api.logout(); loggedOut = true; return res; },
+      navigate: (url) => {
+        // If the sign-out failed, the session may still be alive, and unlocked if the lock
+        // request failed too. Keep the lock then, so the next load sends it again.
+        if (loggedOut) get().setLocked(false);
+        window.location.href = url;
+      },
+    });
+  },
 
   // Plugin activation — the per-user set of activated plugin ids (users.preferences.enabledPlugins).
   // Hydrated in loadPreferences and mutated only via setPluginActivated (the Plugins settings
@@ -157,6 +229,9 @@ export const useStore = create((set, get) => ({
   isLocked: localStorage.getItem('mailflow_locked') === '1',
   setLocked: (locked) => {
     if (locked) {
+      // The lock screen replaces the mail view, and with it an open composer: this lets the
+      // composer hand what it holds to keepComposeForLock first, so it reopens with it on unlock.
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('mailflow:will-lock'));
       const { selectedMessageId } = get();
       if (selectedMessageId) localStorage.setItem('mailflow_locked_message', selectedMessageId);
       localStorage.setItem('mailflow_locked', '1');
@@ -172,12 +247,17 @@ export const useStore = create((set, get) => ({
         accounts: [], accountsReady: false,
         folders: {}, selectedMessageId: null,
         unreadCounts: { total: 0, byAccount: {} },
+        snoozedCount: 0,
+        ...SCHEDULED_RESET,
         notifications: [], threadMessages: {}, expandedThreadId: null,
         backfillProgress: {},
-        gtdSections: null, categoryCounts: {}, activeGtdTab: null,
+        gtdSections: null, categoryCounts: {}, categoryTotals: {}, activeGtdTab: null,
       });
     } else {
-      const restoredMessageId = localStorage.getItem('mailflow_locked_message') || null;
+      // Only for a signed-in user, who is the one unlocking. With nobody signed in (after a
+      // lockout, or on a cold load that found the locked session expired), it is the previous
+      // user's message, and it would open for whoever signs in next: signing in doesn't reload.
+      const restoredMessageId = (get().user && localStorage.getItem('mailflow_locked_message')) || null;
       localStorage.removeItem('mailflow_locked_message');
       localStorage.removeItem('mailflow_locked');
       set({ isLocked: false, selectedMessageId: restoredMessageId });
@@ -186,9 +266,15 @@ export const useStore = create((set, get) => ({
   // Lock now: tell the server (it then 423s the API until unlocked), then drop into
   // the lock overlay locally. Lock the UI even if the server call fails (#235).
   lockScreen: () => {
-    // Lock the UI immediately (never block on the network), then enforce server-side.
+    // Lock the UI immediately (never block on the network), then enforce server-side. The lock
+    // request waits for the next task: what locking sends first (actions still in their undo
+    // window, see flushUndoables) must reach the server before it, or it is refused.
     get().setLocked(true);
-    api.lock().catch(() => {});
+    // The next task, not a timer: auto-lock fires in a hidden tab, where timers are throttled
+    // to once a minute and the server would stay unlocked that long.
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => { channel.port1.close(); api.lock().catch(() => {}); };
+    channel.port2.postMessage(null);
   },
   autoLockMinutes: 0,
   setAutoLockMinutes: (m) => {
@@ -248,6 +334,7 @@ export const useStore = create((set, get) => ({
         messagesOffset: 0,
         hasMoreMessages: true,
         messagesRefreshToken: state.messagesRefreshToken + 1,
+        replyDrafts: {}, replyDraftRevision: state.replyDraftRevision + 1,
         expandedThreadId: null,
         threadMessages: {},
         showContacts: false,
@@ -274,7 +361,7 @@ export const useStore = create((set, get) => ({
     return messages === state.messages ? {} : { messages };
   }),
   updateMessage: (id, updates) => set(state => {
-    const apply = (m) => m.id === id ? { ...m, ...updates } : m;
+    const apply = (m) => m.id === id ? applyMessageUpdate(m, updates) : m;
     const threadMessages = Object.fromEntries(
       Object.entries(state.threadMessages).map(([tid, msgs]) => [tid, msgs.map(apply)])
     );
@@ -289,12 +376,16 @@ export const useStore = create((set, get) => ({
       const tid = m.thread_id || m.id;
       const subs = threadMessages[tid];
       if (!subs) return updated;
-      const unread_count = subs.filter(s => !s.is_read).length;
+      // In one account's view the list counts that account's copies only, and the row's actions
+      // take only those, but the cached conversation also holds other accounts' (#476). Counting
+      // them would let the echo of the reader's own mark-read flip the row back to unread.
+      const counted = state.selectedAccountId ? subs.filter(s => s.account_id === m.account_id) : subs;
+      const unread_count = counted.filter(s => !s.is_read).length;
       return { ...updated, unread_count, is_read: unread_count === 0 };
     });
     return { messages, searchResults: state.searchResults.map(apply), threadMessages };
   }),
-  removeMessage: (id) => set(state => ({
+  removeMessage: (id) => set(state => (noteRemoved(state, new Set([id])), {
     messages: state.messages.filter(m => m.id !== id),
     searchResults: state.searchResults.filter(m => m.id !== id),
     selectedMessageId: state.selectedMessageId === id ? null : state.selectedMessageId,
@@ -306,6 +397,7 @@ export const useStore = create((set, get) => ({
   removeMessages: (ids) => set(state => {
     const idSet = ids instanceof Set ? ids : new Set(ids);
     if (idSet.size === 0) return {};
+    noteRemoved(state, idSet);
     return {
       messages: state.messages.filter(m => !idSet.has(m.id)),
       searchResults: state.searchResults.filter(m => !idSet.has(m.id)),
@@ -313,8 +405,16 @@ export const useStore = create((set, get) => ({
     };
   }),
   restoreMessages: (msgs) => set(state => {
-    const list = Array.isArray(msgs) ? msgs : [msgs];
+    const view = listViewOf(state);
+    const list = (Array.isArray(msgs) ? msgs : [msgs]).filter(m => {
+      const from = removedFromView.get(m?.id);
+      removedFromView.delete(m?.id);
+      return from === undefined || from === view;
+    });
+    if (!list.length) return {};
+    // Back where the server would list it: the folder's order (#528), newest first for search.
     const sort = arr => [...arr].sort((a, b) => new Date(b.date) - new Date(a.date));
+    const sortList = arr => [...arr].sort(compareListOrder(listOrderFor(state.listSort, state.selectedAccountId, state.selectedFolder)));
     // Deduplicate against both the main list and searchResults by stable identity (Message-ID when
     // present, else id): if the message is already present — including re-added by a network
     // refresh under a regenerated id (matched via Message-ID) — skip it. The local copy carries the
@@ -323,7 +423,7 @@ export const useStore = create((set, get) => ({
     if (missing.length === 0 && !state.searchQuery.trim()) return {};
     const missingFromSearch = missingByIdentity(state.searchResults, list);
     return {
-      messages: missing.length ? sort([...state.messages, ...missing]) : state.messages,
+      messages: missing.length ? sortList([...state.messages, ...missing]) : state.messages,
       searchResults: state.searchQuery.trim() && missingFromSearch.length
         ? sort([...state.searchResults, ...missingFromSearch])
         : state.searchResults,
@@ -345,6 +445,24 @@ export const useStore = create((set, get) => ({
   serverUnreadCounts: { total: 0, byAccount: {}, snapshots: {} },
   pendingCounts: {},
   unreadCounts: { total: 0, byAccount: {}, snapshots: {}, complete: false },
+  // How many messages are snoozed (#269), from the same server count as the badges.
+  snoozedCount: 0,
+  // Scheduled send (#543, design 5.3): the pending count and how many need attention, from the
+  // same server count; the Scheduled view's list as GET /mail/scheduled last returned it (null
+  // until it is loaded), the subjects and recipients seen for each message (the server deletes them
+  // once it is sent, so a message sent while this tab was open still shows what it was), and the
+  // message a notification link asked to show.
+  ...SCHEDULED_RESET,
+  setScheduledList: (list) => set(state => {
+    if (state.isLocked) return {};
+    const summaries = {};
+    for (const m of list?.messages || []) {
+      const summary = m.summary || state.scheduledSummaries[m.id];
+      if (summary) summaries[m.id] = summary;
+    }
+    return { scheduledList: list, scheduledSummaries: summaries };
+  }),
+  setScheduledHighlight: (id) => set({ scheduledHighlight: id || null }),
   setUnreadCounts: (counts) => set(state => {
     if (state.isLocked) return {};
     const server = mergeCountSnapshots(state.serverUnreadCounts, counts);
@@ -354,21 +472,27 @@ export const useStore = create((set, get) => ({
     const pending = settleCountPending(state.pendingCounts, server);
     if (!Object.keys(pending).length) { clearTimeout(pendingCountTimer); pendingCountTimer = null; }
     return { serverUnreadCounts: server, pendingCounts: pending,
-      unreadCounts: displayCountSnapshot(server, pending, state.accounts) };
+      unreadCounts: displayCountSnapshot(server, pending, state.accounts),
+      ...(typeof counts?.snoozed === 'number' ? { snoozedCount: counts.snoozed } : {}),
+      ...(counts?.scheduled && typeof counts.scheduled.pending === 'number' ? {
+        scheduledCount: counts.scheduled.pending, scheduledAttention: Number(counts.scheduled.attention) || 0,
+      } : {}) };
   }),
-  adjustUnread: (accountId, delta) => {
+  // { undoable: true } marks a change the server only hears about once its undo window closes.
+  adjustUnread: (accountId, delta, { undoable = false } = {}) => {
     set(state => {
       if (state.isLocked) return {};
       const displayed = displayCountSnapshot(state.serverUnreadCounts, state.pendingCounts, state.accounts);
-      const pending = adjustCountPending(state.pendingCounts, displayed, accountId, delta);
+      const pending = adjustCountPending(state.pendingCounts, displayed, accountId, delta, Date.now(),
+        { commitDelayMs: undoable ? UNDO_COMMIT_DELAY_MS : 0 });
       return { pendingCounts: pending,
         unreadCounts: displayCountSnapshot(state.serverUnreadCounts, pending, state.accounts) };
     });
-    // Do not reset this timer on subsequent clicks: continuous activity cannot freeze counts.
+    // Not reset per click: when it fires, it re-arms for a window a later change extended.
     if (!pendingCountTimer) expirePendingCounts();
   },
-  decrementUnread: (accountId, count = 1) => get().adjustUnread(accountId, -count),
-  incrementUnread: (accountId, count = 1) => get().adjustUnread(accountId, count),
+  decrementUnread: (accountId, count = 1, options) => get().adjustUnread(accountId, -count, options),
+  incrementUnread: (accountId, count = 1, options) => get().adjustUnread(accountId, count, options),
 
   // Folder badges always show observed server values. Row-level read/move optimism
   // remains immediate; aggregate thread estimates must not overwrite these snapshots.
@@ -459,10 +583,61 @@ export const useStore = create((set, get) => ({
     }
     set({ customSoundDataUrl: dataUrl });
   },
+  replyDrafts: {},
+  replyDraftRevision: 0,
+  invalidateReplyDrafts: () => set(state => ({ replyDrafts: {}, replyDraftRevision: state.replyDraftRevision + 1 })),
+  setReplyDraftStatus: (id, status, source, revision) => set(state => {
+    if (revision !== undefined && revision !== state.replyDraftRevision) return {};
+    if (source === 'cached' && state.replyDrafts[id]?.source === 'live') return {};
+    return { replyDrafts: { ...state.replyDrafts, [id]: { ...status, source } } };
+  }),
+  autoOpenReplyDrafts: localStorage.getItem('mailflow_auto_open_reply_drafts') === 'true',
+  setAutoOpenReplyDrafts: value => {
+    localStorage.setItem('mailflow_auto_open_reply_drafts', String(Boolean(value)));
+    set({ autoOpenReplyDrafts: Boolean(value) });
+    schedulePrefSave({ autoOpenReplyDrafts: Boolean(value) });
+  },
   composing: false,
   composeData: null,
-  openCompose: (data = null) => set({ composing: true, composeData: data }),
-  closeCompose: () => set({ composing: false, composeData: null }),
+  composeSession: 0,
+  prepareComposeSwitch: null,
+  setPrepareComposeSwitch: prepare => set({ prepareComposeSwitch: prepare }),
+  // The open composer's current state, kept across the lock screen (see setLocked).
+  keepComposeForLock: (session, data) => set(state =>
+    state.composing && state.composeSession === session ? { composeData: data } : {}),
+  // `draft` ({ draftUid, draftFolder, draftAccountId }): the copy the save wrote. A save that
+  // answers after the composer was put away for the lock screen (keepComposeForLock) points the
+  // composer that reopens at it, rather than at the copy it replaced.
+  updateComposePersistedKey: (session, persistedKey, draft = {}) => set(state =>
+    state.composing && state.composeSession === session
+      ? { composeData: { ...state.composeData, persistedKey, ...draft } } : {}),
+  openCompose: (data = null, { preparedSession } = {}) => {
+    const initial = get();
+    if (initial.composing && data?.persistedKey && data.persistedKey === initial.composeData?.persistedKey) return true;
+    const replace = () => {
+      set(state => ({ composing: true, composeSession: state.composeSession + 1, composeData: data, prepareComposeSwitch: null }));
+      return true;
+    };
+    if (preparedSession !== undefined && preparedSession !== initial.composeSession) return false;
+    // Reply-draft opening already saved this exact editor and revalidated its target.
+    if (!initial.composing || preparedSession === initial.composeSession) return replace();
+    // Every ordinary Compose/Reply/draft-list entry point shares this guard. A
+    // composer still mounting cannot yet prove that its content is safe to replace.
+    if (!initial.prepareComposeSwitch) return false;
+    let ownerChanged = false;
+    const unsubscribe = useStore.subscribe(state => { if (state.user?.id !== initial.user?.id) ownerChanged = true; });
+    return (async () => {
+      try {
+        if (!(await initial.prepareComposeSwitch())) return false;
+        const state = get();
+        if (ownerChanged || state.user?.id !== initial.user?.id || !state.composing
+          || state.composeSession !== initial.composeSession || state.prepareComposeSwitch !== initial.prepareComposeSwitch) return false;
+        return replace();
+      } catch { return false; }
+      finally { unsubscribe(); }
+    })();
+  },
+  closeCompose: () => set({ composing: false, composeData: null, prepareComposeSwitch: null }),
 
   // Detached message windows (#219): floating, draggable/resizable in-app windows
   // that each show one message via a MessagePane instance. Desktop-only; mounted by
@@ -481,8 +656,12 @@ export const useStore = create((set, get) => ({
           w.messageId === messageId ? { ...w, minimized: false, z: seq } : w),
       };
     }
-    const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
-    const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+    // The screen in the window's own pixels: MailApp scales the interface by the font size, so at
+    // 125% a screen-sized window in screen pixels opens a quarter taller than the screen, with its
+    // resize handle out of reach (#591).
+    const scale = (state.fontSize || 100) / 100;
+    const vw = (typeof window !== 'undefined' ? window.innerWidth : 1280) / scale;
+    const vh = (typeof window !== 'undefined' ? window.innerHeight : 800) / scale;
     const w = Math.min(660, Math.max(360, vw - 80));
     const h = Math.min(740, Math.max(280, vh - 80));
     // Cascade each new window down-right so they don't stack exactly on top.
@@ -518,7 +697,8 @@ export const useStore = create((set, get) => ({
   })),
   closeAllMessageWindows: () => set({ messageWindows: [] }),
   searchQuery: '',
-  setSearchQuery: (q) => set({ searchQuery: q }),
+  setSearchQuery: (q) => set(state => q === state.searchQuery ? {} : { searchQuery: q,
+    replyDrafts: {}, replyDraftRevision: state.replyDraftRevision + 1 }),
   isSearching: false,
   setIsSearching: (v) => set({ isSearching: v }),
   searchResults: [],
@@ -533,6 +713,9 @@ export const useStore = create((set, get) => ({
   addNotification: (n) => set(state => ({
     notifications: [{ ...n, id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}` }, ...state.notifications].slice(0, 5)
   })),
+  dismissUndoNotifications: (matches = () => true) => set(state => ({
+    notifications: state.notifications.filter(n => typeof n.onUndo !== 'function' || !matches(n)),
+  })),
   removeNotification: (id) => set(state => ({
     notifications: state.notifications.filter(n => n.id !== id)
   })),
@@ -542,6 +725,10 @@ export const useStore = create((set, get) => ({
   adminTab: 'accounts', // 'accounts' | 'appearance' | 'integrations' | 'users'
   setShowAdmin: (v) => set({ showAdmin: v }),
   setAdminTab: (t) => set({ adminTab: t }),
+  // Settings > Accounts opened for one account from elsewhere (the sidebar's error label or
+  // menu): { accountId, action: 'focus' | 'signIn' }, consumed by the Accounts tab.
+  accountsIntent: null,
+  setAccountsIntent: (intent) => set({ accountsIntent: intent }),
 
   // Contacts view
   showContacts: false,
@@ -559,7 +746,7 @@ export const useStore = create((set, get) => ({
   setMobileSidebarOpen: (v) => set({ mobileSidebarOpen: v }),
 
   // Language
-  language: localStorage.getItem('mailflow_language') || 'en',
+  language: initialLanguage,
   setLanguage: (lng) => {
     localStorage.setItem('mailflow_language', lng);
     set({ language: lng });
@@ -588,7 +775,8 @@ export const useStore = create((set, get) => ({
     if (!next) return;
     localStorage.setItem('mailflow_conversation_mode', next.conversationMode);
     localStorage.setItem('mailflow_threaded_view', String(groupsMessageList(next.conversationMode)));
-    set({ ...next, threadedView: groupsMessageList(next.conversationMode) });
+    set(state => ({ ...next, threadedView: groupsMessageList(next.conversationMode),
+      replyDrafts: {}, replyDraftRevision: state.replyDraftRevision + 1 }));
     schedulePrefSave({ conversationMode: next.conversationMode, threadedView: groupsMessageList(next.conversationMode) });
   },
   setThreadedView: (val) => {
@@ -624,6 +812,24 @@ export const useStore = create((set, get) => ({
     schedulePrefSave({ hoverQuickActions: val });
   },
 
+  // #440: WHICH quick actions the hover cluster shows. Stored as a subset of
+  // HOVER_ACTION_KEYS (RowHoverActions.jsx); order is always canonical, so the setter
+  // normalizes by filtering the canonical list — customization is membership, not order.
+  // Unknown keys from an older or edited pref are dropped on read.
+  hoverActionSet: (() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('mailflow_hover_action_set') || 'null');
+      if (Array.isArray(saved)) return sanitizeHoverActionSet(saved);
+    } catch { /* corrupted pref — fall back to the default cluster */ }
+    return [...DEFAULT_HOVER_ACTIONS];
+  })(),
+  setHoverActionSet: (keys) => {
+    const val = sanitizeHoverActionSet(keys);
+    localStorage.setItem('mailflow_hover_action_set', JSON.stringify(val));
+    set({ hoverActionSet: val });
+    schedulePrefSave({ hoverActionSet: val });
+  },
+
   // Show sender avatars in the mobile message list (off by default — they cost row width
   // on a narrow screen; opt-in for users who prefer the scannability). Desktop always shows them.
   showMobileAvatars: localStorage.getItem('mailflow_show_mobile_avatars') === 'true',
@@ -655,6 +861,27 @@ export const useStore = create((set, get) => ({
     localStorage.setItem('mailflow_reply_default', val);
     set({ replyDefault: val });
     schedulePrefSave({ replyDefault: val });
+  },
+
+  // What opens when the open message leaves the list by delete, archive, move, spam or snooze
+  // (#572): 'next' (the default, which the list's own actions always did), 'previous', or 'list'
+  // to go back to the list. See utils/listSelection.js.
+  afterRemove: ['next', 'previous', 'list'].includes(localStorage.getItem('mailflow_after_remove'))
+    ? localStorage.getItem('mailflow_after_remove') : 'next',
+  setAfterRemove: (val) => {
+    if (!['next', 'previous', 'list'].includes(val)) return;
+    localStorage.setItem('mailflow_after_remove', val);
+    set({ afterRemove: val });
+    schedulePrefSave({ afterRemove: val });
+  },
+
+  // Show email bodies dark in a dark theme where that is safe (#228, utils/darkScheme.js). On by
+  // default; a light theme never darkens an email, and any message can be switched back on its own.
+  darkEmailBodies: localStorage.getItem('mailflow_dark_email_bodies') !== 'false',
+  setDarkEmailBodies: (value) => {
+    localStorage.setItem('mailflow_dark_email_bodies', String(Boolean(value)));
+    set({ darkEmailBodies: Boolean(value) });
+    schedulePrefSave({ darkEmailBodies: Boolean(value) });
   },
 
   markReadBehavior: localStorage.getItem('mailflow_mark_read_behavior') || 'immediate',
@@ -740,9 +967,11 @@ export const useStore = create((set, get) => ({
     schedulePrefSave({ categorizationEnabled: val });
   },
 
-  // Unread counts per category for the tab bar badges { primary: N, newsletter: N, ... }
+  // Per category of the Inbox, for the tab bar: unread { primary: N, newsletter: N, ... } and how
+  // many messages each holds (#597). A caller with only unread counts leaves the totals as they are.
   categoryCounts: {},
-  setCategoryCounts: (counts) => set({ categoryCounts: counts }),
+  categoryTotals: {},
+  setCategoryCounts: (counts, totals) => set(totals ? { categoryCounts: counts, categoryTotals: totals } : { categoryCounts: counts }),
   adjustCategoryCount: (category, delta) => set(state => {
     const key = category || 'primary';
     const current = state.categoryCounts[key] || 0;
@@ -998,6 +1227,30 @@ export const useStore = create((set, get) => ({
     schedulePrefSave({ collapsedFolders: next });
   },
 
+  // Each folder's list order (#528, #196): { "<accountId or all>:<folder>": { sort, dir, starredFirst } }.
+  // A folder at the default order has no entry.
+  listSort: (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem('mailflow_list_sort') || '{}');
+      return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+    } catch { return {}; }
+  })(),
+  setListOrder: (accountId, folder, order) => {
+    const key = listSortKey(accountId, folder);
+    // eslint-disable-next-line no-unused-vars
+    const { [key]: _old, ...rest } = get().listSort;
+    let next = isDefaultListOrder(order)
+      ? rest
+      : { ...rest, [key]: { sort: order.sort, dir: order.dir, starredFirst: Boolean(order.starredFirst) } };
+    // The server refuses more than 500 (and with them every preference saved alongside), so the
+    // folders sorted longest ago give way first.
+    const keys = Object.keys(next);
+    if (keys.length > 400) next = Object.fromEntries(keys.slice(keys.length - 400).map(k => [k, next[k]]));
+    localStorage.setItem('mailflow_list_sort', JSON.stringify(next));
+    set({ listSort: next });
+    schedulePrefSave({ listSort: next });
+  },
+
   // Favorite folders — [{ accountId, path }, ...] ordered by insertion
   favoriteFolders: (() => {
     try { return JSON.parse(localStorage.getItem('mailflow_favorite_folders') || '[]'); }
@@ -1088,6 +1341,10 @@ export const useStore = create((set, get) => ({
           : (Number(localStorage.getItem('mailflow_list_width')) || undefined);
         applyLayout(clean, savedListWidth);
       }
+      if (typeof prefs.autoOpenReplyDrafts === 'boolean') {
+        localStorage.setItem('mailflow_auto_open_reply_drafts', String(prefs.autoOpenReplyDrafts));
+        set({ autoOpenReplyDrafts: prefs.autoOpenReplyDrafts });
+      }
       if (prefs.notificationSound) {
         localStorage.setItem('mailflow_notification_sound', prefs.notificationSound);
         set({ notificationSound: prefs.notificationSound });
@@ -1155,6 +1412,10 @@ export const useStore = create((set, get) => ({
         localStorage.setItem('mailflow_collapsed_folders', JSON.stringify(prefs.collapsedFolders));
         set({ collapsedFolders: prefs.collapsedFolders });
       }
+      if (prefs.listSort && typeof prefs.listSort === 'object' && !Array.isArray(prefs.listSort)) {
+        localStorage.setItem('mailflow_list_sort', JSON.stringify(prefs.listSort));
+        set({ listSort: prefs.listSort });
+      }
       if (Array.isArray(prefs.favoriteFolders)) {
         localStorage.setItem('mailflow_favorite_folders', JSON.stringify(prefs.favoriteFolders));
         set({ favoriteFolders: prefs.favoriteFolders });
@@ -1186,6 +1447,11 @@ export const useStore = create((set, get) => ({
         localStorage.setItem('mailflow_hover_quick_actions', String(prefs.hoverQuickActions));
         set({ hoverQuickActions: prefs.hoverQuickActions });
       }
+      if (Array.isArray(prefs.hoverActionSet)) {
+        const hoverSet = sanitizeHoverActionSet(prefs.hoverActionSet);
+        localStorage.setItem('mailflow_hover_action_set', JSON.stringify(hoverSet));
+        set({ hoverActionSet: hoverSet });
+      }
       if (typeof prefs.showMobileAvatars === 'boolean') {
         localStorage.setItem('mailflow_show_mobile_avatars', String(prefs.showMobileAvatars));
         set({ showMobileAvatars: prefs.showMobileAvatars });
@@ -1201,6 +1467,14 @@ export const useStore = create((set, get) => ({
       if (prefs.replyDefault === 'reply' || prefs.replyDefault === 'replyAll') {
         localStorage.setItem('mailflow_reply_default', prefs.replyDefault);
         set({ replyDefault: prefs.replyDefault });
+      }
+      if (typeof prefs.darkEmailBodies === 'boolean') {
+        localStorage.setItem('mailflow_dark_email_bodies', String(prefs.darkEmailBodies));
+        set({ darkEmailBodies: prefs.darkEmailBodies });
+      }
+      if (['next', 'previous', 'list'].includes(prefs.afterRemove)) {
+        localStorage.setItem('mailflow_after_remove', prefs.afterRemove);
+        set({ afterRemove: prefs.afterRemove });
       }
       if (prefs.markReadBehavior === 'immediate' || prefs.markReadBehavior === 'delay' || prefs.markReadBehavior === 'manual') {
         localStorage.setItem('mailflow_mark_read_behavior', prefs.markReadBehavior);

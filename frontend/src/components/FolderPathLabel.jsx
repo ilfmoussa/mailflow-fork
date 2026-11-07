@@ -1,13 +1,17 @@
 import { useLayoutEffect, useRef, useState } from 'react';
-import { folderParentLabel } from '../utils/folderDisplay.js';
+import { useTranslation } from 'react-i18next';
+import { folderDisplayName, folderParentLabel } from '../utils/folderDisplay.js';
 
 // Folder name prefixed with its muted ancestor path ("Personal / Insurance"),
 // used by every move-to-folder picker so duplicate names under different
 // parents stay distinguishable. Long labels truncate at rest (the parent
 // chain shrinks first); hovering a label that overflows slides the text left
 // marquee-style to reveal the clipped remainder, and it snaps back on leave.
-export default function FolderPathLabel({ folder }) {
-  const parent = folderParentLabel(folder);
+// `label`, when given, replaces the name and its path: a renamed favorite reads as the name the
+// user chose, the way the sidebar shows it.
+export default function FolderPathLabel({ folder, label }) {
+  const { t } = useTranslation();
+  const parent = label ? '' : folderParentLabel(folder);
   const viewportRef = useRef(null);
   const contentRef = useRef(null);
   const [hovered, setHovered] = useState(false);
@@ -57,7 +61,7 @@ export default function FolderPathLabel({ folder }) {
           </span>
         )}
         <span style={segmentStyle}>
-          {folder.name || folder.path}
+          {label || folderDisplayName(folder, t)}
         </span>
       </span>
     </span>

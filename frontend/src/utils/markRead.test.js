@@ -43,8 +43,9 @@ globalThis.fetch = async (url, opts = {}) => {
 };
 
 const { useStore } = await import('../store/index.js');
-const { applyMarkRead, scheduleMarkRead } = await import('./markRead.js');
-const { pendingMarkReadMap, completedMarkReadMap } = await import('./pendingReads.js');
+const markRead = await import('./markRead.js');
+const { applyMarkRead, scheduleMarkRead, cancelScheduledMarkRead, cancelScheduledMarkReadFor } = markRead;
+const { pendingMarkReadMap, completedMarkReadMap, setPending, settleMarkRead, failMarkRead, clearReadGuard } = await import('./pendingReads.js');
 
 const MSG = { id: 'm1', account_id: 'acct', category: 'primary', is_read: false };
 const tick = (ms = 0) => new Promise(r => setTimeout(r, ms));
@@ -71,6 +72,93 @@ describe('applyMarkRead', () => {
     assert.equal(completedMarkReadMap.get('m1'), 'acct', 'the commit is recorded for racing SELECTs');
   });
 
+  // Opening a conversation marks its row read from the list, then the card the pane opens marks the
+  // same message read again from the thread's copy, fetched before the first read landed. That
+  // second read took the message off the unread badge a second time.
+  const spyDecrement = async (run) => {
+    const decremented = [];
+    const { decrementUnread } = useStore.getState();
+    useStore.setState({ decrementUnread: id => decremented.push(id) });
+    try { await run(); } finally { useStore.setState({ decrementUnread }); }
+    return decremented;
+  };
+
+  for (const [when, settle] of [['in flight', false], ['just landed', true]]) {
+    test(`a stale copy is not counted again while the list's read is ${when}`, async () => {
+      useStore.getState().setMessages([{ ...MSG, is_read: true }]);
+      const token = setPending('m1', 'acct');
+      if (settle) settleMarkRead('m1', 'acct', token);
+      const changes = [];
+      const decremented = await spyDecrement(async () => {
+        applyMarkRead({ ...MSG }, { onChange: read => changes.push(read) });
+        await tick();
+      });
+      assert.deepEqual(decremented, [], 'the badge is not taken down again');
+      assert.deepEqual(bulkReads, [], 'nor is the read sent again');
+      assert.deepEqual(changes, [true], 'the caller\'s own copy still learns it is read');
+    });
+  }
+
+  // The list's read the card leaned on can still fail: the list rolls the store back, and the card's
+  // copy has to follow, or it goes on showing the message read.
+  test('when the list\'s read it leaned on fails, the caller\'s copy is rolled back too', async () => {
+    useStore.getState().setMessages([{ ...MSG, is_read: true }]);
+    const token = setPending('m1', 'acct');
+    const changes = [];
+    applyMarkRead({ ...MSG }, { onChange: read => changes.push(read) });
+    assert.deepEqual(changes, [true]);
+    assert.equal(failMarkRead('m1', token), true);
+    assert.deepEqual(changes, [true, false]);
+  });
+
+  test('when that read lands, or the user marks it unread meanwhile, nothing is rolled back', async () => {
+    useStore.getState().setMessages([{ ...MSG, is_read: true }]);
+    const changes = [];
+    const landed = setPending('m1', 'acct');
+    applyMarkRead({ ...MSG }, { onChange: read => changes.push(read) });
+    settleMarkRead('m1', 'acct', landed);
+    const undone = setPending('m1', 'acct');
+    applyMarkRead({ ...MSG }, { onChange: read => changes.push(read) });
+    clearReadGuard('m1');
+    assert.equal(failMarkRead('m1', undone), false);
+    assert.deepEqual(changes, [true, true]);
+  });
+
+  // The store's flag alone proves nothing: another device may have marked the message unread while
+  // the socket was down, so the store still shows it read.
+  test('a store that shows the message read, with no read of ours under way, does not stop it', async () => {
+    useStore.getState().setMessages([{ ...MSG, is_read: true }]);
+    const decremented = await spyDecrement(async () => {
+      applyMarkRead({ ...MSG });
+      await tick();
+    });
+    assert.deepEqual(decremented, ['acct']);
+    assert.deepEqual(bulkReads, [{ ids: ['m1'], read: true }]);
+  });
+
+  // Read and landed, then marked unread somewhere the guard did not hear of: the store shows it unread.
+  test('a landed read does not stop it once the store shows the message unread', async () => {
+    useStore.getState().setMessages([{ ...MSG, is_read: false }]);
+    settleMarkRead('m1', 'acct', setPending('m1', 'acct'));
+    const decremented = await spyDecrement(async () => {
+      applyMarkRead({ ...MSG });
+      await tick();
+    });
+    assert.deepEqual(decremented, ['acct']);
+    assert.deepEqual(bulkReads, [{ ids: ['m1'], read: true }]);
+  });
+
+  test('a list read that failed does not stop it', async () => {
+    const token = setPending('m1', 'acct');
+    assert.equal(failMarkRead('m1', token), true);
+    const decremented = await spyDecrement(async () => {
+      applyMarkRead({ ...MSG });
+      await tick();
+    });
+    assert.deepEqual(decremented, ['acct']);
+    assert.deepEqual(bulkReads, [{ ids: ['m1'], read: true }]);
+  });
+
   test('rolls the flag back when the request fails', async () => {
     failNext = true;
     applyMarkRead({ ...MSG });
@@ -90,6 +178,15 @@ describe('applyMarkRead', () => {
 });
 
 describe('scheduleMarkRead', () => {
+  test('explicit unread cancels every pending reader timer for that message', async () => {
+    useStore.setState({ markReadBehavior: 'delay', markReadDelay: 0.03 });
+    scheduleMarkRead({ ...MSG });
+    scheduleMarkRead({ ...MSG });
+    cancelScheduledMarkReadFor(MSG.id);
+    await tick(70);
+    assert.deepEqual(bulkReads, []);
+    assert.equal(readFlag(), false);
+  });
   test('marks immediately by default', async () => {
     const timer = scheduleMarkRead({ ...MSG });
     assert.equal(timer, null, 'nothing to cancel when the mark already happened');
@@ -111,7 +208,7 @@ describe('scheduleMarkRead', () => {
 
     const cancelled = scheduleMarkRead({ ...MSG });
     assert.notEqual(cancelled, null, 'a deferred mark hands back a handle to cancel');
-    clearTimeout(cancelled);
+    cancelScheduledMarkRead(cancelled);
     await tick(80);
     assert.deepEqual(bulkReads, [], 'a reader who moves on before the delay does not mark it read');
 
@@ -120,5 +217,44 @@ describe('scheduleMarkRead', () => {
     assert.deepEqual(bulkReads, [], 'still nothing while the delay is running');
     await tick(80);
     assert.equal(bulkReads.length, 1, 'and it marks once the delay elapses');
+  });
+
+  test('caller cancellation removes its handle from the scheduled registry', () => {
+    useStore.setState({ markReadBehavior: 'delay', markReadDelay: 10 });
+    const timer = scheduleMarkRead({ ...MSG });
+    const originalClearTimeout = globalThis.clearTimeout;
+    let clears = 0;
+    globalThis.clearTimeout = (...args) => { clears++; return originalClearTimeout(...args); };
+    try {
+      cancelScheduledMarkRead(timer);
+      cancelScheduledMarkReadFor(MSG.id);
+      assert.equal(clears, 1, 'cancel-by-message must not see an already cancelled handle');
+    } finally {
+      globalThis.clearTimeout = originalClearTimeout;
+      originalClearTimeout(timer);
+    }
+  });
+});
+
+describe('scheduleMarkReadTimer (#683)', () => {
+  test("cancelScheduledMarkReadFor reaches another caller's timer for the message", async () => {
+    // The list's read-on-open delay is registered here, so the reading pane's and the
+    // hotkeys' explicit read or unread can cancel it by message id.
+    let ran = 0;
+    const timer = markRead.scheduleMarkReadTimer('reg-1', () => { ran += 1; }, 20);
+    assert.ok(timer);
+    markRead.cancelScheduledMarkReadFor('reg-1');
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(ran, 0);
+  });
+
+  test('runs once when nothing cancels it, and leaves nothing behind', async () => {
+    let ran = 0;
+    const timer = markRead.scheduleMarkReadTimer('reg-2', () => { ran += 1; }, 10);
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(ran, 1);
+    markRead.cancelScheduledMarkRead(timer);
+    markRead.cancelScheduledMarkReadFor('reg-2');
+    assert.equal(ran, 1);
   });
 });

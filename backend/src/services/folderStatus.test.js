@@ -75,7 +75,7 @@ describe('bounded background monitor', () => {
     expect(events).toEqual(['open', 'close', 'sync']);
     expect(query.mock.calls[0][0]).toContain('NOT f.no_select');
     expect(query.mock.calls[0][0]).toContain('LIMIT $2');
-    expect(query.mock.calls[0][1]).toEqual(['a', STATUS_FOLDER_BATCH]);
+    expect(query.mock.calls[0][1]).toEqual(['a', STATUS_FOLDER_BATCH, []]);
   });
   it('does not let repeated Inbox ingestion failures starve unattempted folders', async () => {
     query.mockImplementation(async sql => sql.includes('SELECT f.*')
@@ -97,6 +97,99 @@ describe('bounded background monitor', () => {
     expect(enqueueSync.mock.calls[0][1]).toBe('INBOX');
   });
 
+  it('stops the folder walk when the client dies mid-cycle, bounding it to one close', async () => {
+    // A timed-out STATUS destroys the transport (observeFolder's fuse). On a
+    // secondaryOverPool provider that transport is the account's ONE pooled session, so
+    // the walk must not go on to fail the remaining folders against a dead client: the
+    // break is what bounds the cost to one close (and one later gated grow) per cycle
+    // (#474 round 5 review).
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    query.mockImplementation(async sql => sql.includes('SELECT f.*')
+      ? { rows: [{ path: 'INBOX' }, { path: 'Sent' }, { path: 'Trash' }] }
+      : sql.includes('nextval') ? { rows: [{ revision: '1', started_at: new Date(0) }] } : { rows: [] });
+    const client = {
+      usable: true,
+      status: vi.fn(() => { client.usable = false; return Promise.reject(new Error('Folder STATUS timed out')); }),
+    };
+    const monitor = new FolderStatusMonitor({ withClient: async (_a, fn) => fn(client), enqueueSync: vi.fn(), broadcast: vi.fn() });
+    await monitor.refresh({ id: 'a' });
+    expect(client.status).toHaveBeenCalledTimes(1); // Sent and Trash waited for the next cycle
+  });
+
+  // #701: the STATUS after a delete was dropped when another cycle had started less than 5s
+  // before, so the deleted message stayed on the badge until the next periodic cycle.
+  const countingMonitor = () => {
+    query.mockImplementation(async sql => sql.includes('SELECT f.*') ? { rows: [{ path: 'INBOX' }] }
+      : sql.includes('nextval') ? { rows: [{ revision: '1', started_at: new Date(0) }] } : { rows: [{ id: 'f' }] });
+    const withClient = vi.fn(async (_a, fn) => fn({ status: async () => good }));
+    return { withClient, monitor: new FolderStatusMonitor({ withClient, enqueueSync: () => false, broadcast: vi.fn() }) };
+  };
+  it('holds a forced refresh asked for inside the minimum interval instead of dropping it', async () => {
+    vi.useFakeTimers();
+    const { withClient, monitor } = countingMonitor();
+    const a = { id: 'a' };
+    await monitor.refresh(a);
+    await vi.advanceTimersByTimeAsync(2000);
+    await monitor.refresh(a, { force: true });
+    await monitor.refresh(a, { force: true });
+    expect(withClient).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(withClient).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(withClient).toHaveBeenCalledTimes(2);
+  });
+  it('runs a forced refresh asked for during a cycle again once that cycle is done', async () => {
+    vi.useFakeTimers();
+    const { withClient, monitor } = countingMonitor();
+    let release;
+    withClient.mockImplementationOnce(async (_a, fn) => { await new Promise(r => { release = r; }); return fn({ status: async () => good }); });
+    const a = { id: 'a' };
+    const first = monitor.refresh(a);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(monitor.refresh(a, { force: true })).toBe(first);
+    release();
+    await first;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(withClient).toHaveBeenCalledTimes(2);
+  });
+  it('does not hold a forced refresh for an account in failure backoff', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { withClient, monitor } = countingMonitor();
+    withClient.mockRejectedValueOnce(new Error('offline'));
+    const a = { id: 'a' };
+    await monitor.refresh(a);
+    await vi.advanceTimersByTimeAsync(2000);
+    await monitor.refresh(a, { force: true });
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(withClient).toHaveBeenCalledTimes(1);
+  });
+  it('checks the folders a change touched in the next cycle, on top of the rotation (#708)', async () => {
+    vi.useFakeTimers();
+    const { monitor } = countingMonitor();
+    const a = { id: 'a' };
+    monitor.noteChangedFolders('a', ['Projects', undefined, '', 'Trash', 'Projects']);
+    await monitor.refresh(a);
+    const selects = () => query.mock.calls.filter(([sql]) => sql.includes('SELECT f.*'));
+    expect(selects()[0][0]).toContain("(f.path='INBOX') DESC, (f.path = ANY($3::text[])) DESC");
+    expect(selects()[0][1]).toEqual(['a', STATUS_FOLDER_BATCH + 2, ['Projects', 'Trash']]);
+    await vi.advanceTimersByTimeAsync(60000);
+    await monitor.refresh(a);
+    expect(selects()[1][1]).toEqual(['a', STATUS_FOLDER_BATCH, []]);
+  });
+  it('still owes a changed folder its check when the cycle that took it fails', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { withClient, monitor } = countingMonitor();
+    withClient.mockRejectedValueOnce(new Error('offline'));
+    const a = { id: 'a' };
+    monitor.noteChangedFolders('a', ['Projects']);
+    await monitor.refresh(a);
+    await vi.advanceTimersByTimeAsync(60000);
+    await monitor.refresh(a);
+    const selects = query.mock.calls.filter(([sql]) => sql.includes('SELECT f.*'));
+    expect(selects.map(c => c[1][2])).toEqual([['Projects'], ['Projects']]);
+  });
   it('backs off login failures and does not enqueue work', async () => {
     vi.useFakeTimers();
     vi.spyOn(console, 'warn').mockImplementation(() => {});

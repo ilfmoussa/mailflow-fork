@@ -1,53 +1,95 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../utils/api.js';
+import { useMobile } from '../hooks/useMobile.js';
+import { useListFirst } from '../hooks/useListFirst.js';
+import { closeOpenMessage } from '../utils/closeMessage.js';
 import { useStore } from '../store/index.js';
 import {
   normalizeConversation,
   initialExpandedMessageIds,
-  conversationMembershipKey,
   newestConversationMessage,
 } from '../utils/conversation.js';
-import { archiveThread, deleteThread, spamThread, moveThread, snoozeThread } from '../utils/threadActions.js';
+import { archiveThread, deleteThread, spamThread, moveThread, snoozeThread, inAccount, otherAccountsDraft } from '../utils/threadActions.js';
+import { advanceSelectionAfterRemoval, adjacentRow, openAdjacentRow } from '../utils/listSelection.js';
+import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import SwipePager from './SwipePager.jsx';
+import { buildPrintDocument, openPrintWindow, printInWindow } from '../utils/printMessage.js';
 import ConversationMessageCard from './ConversationMessageCard.jsx';
+import { aiReplyAvailable } from '../utils/aiReply.js';
 import ContextMenu from './ContextMenu.jsx';
+import { prefetchBody } from '../utils/bodyCache.js';
+import { applyReadGuard } from '../utils/pendingReads.js';
+import { applyDeleteGuard } from '../utils/pendingDeletes.js';
+import { ActionBtn, ArchiveIcon, MoveIcon, SnoozeIcon, SpamIcon, PrintIcon, TrashIcon, useShortcutTitle } from './MessageActions.jsx';
+import { PluginSlot } from '../plugins/PluginSlot.jsx';
 
-function ThreadBtn({ onClick, title, children }) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      aria-label={title}
-      style={{
-        display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 10px',
-        background: 'none', border: '1px solid var(--border)', borderRadius: 4,
-        color: 'var(--text-primary)', font: 'inherit', fontSize: 13, cursor: 'pointer',
-      }}
-    >
-      {children}
-    </button>
-  );
-}
+// What the reader is told when an action finds nothing to take (runAction below). In the unified
+// inbox, which has no "this account" to speak of, only Spam and Snooze can: keepDraftsApart and
+// archiveTargetsForFolder never leave Archive, Delete or Move with nothing there.
+const NOTHING_TO_TAKE = {
+  archive: 'message.archived.nothingFromAccount',
+  delete: 'messageList.deleted.nothingFromAccount',
+  move: 'message.moved.nothingFromAccount',
+  spam: 'spam.nothingFromAccount',
+  snooze: 'message.snoozed.nothingFromAccount',
+};
+const NOTHING_TO_TAKE_UNIFIED = {
+  spam: 'spam.nothingInConversation',
+  snooze: 'message.snoozed.nothingInConversation',
+};
+// With the other account's draft picked under the row, Archive and Move take nothing even though
+// the row's account has mail in the conversation, so "nothing from this account" would be untrue.
+const NOTHING_TO_TAKE_DRAFT = {
+  archive: 'message.archived.otherAccountDraft',
+  move: 'message.moved.otherAccountDraft',
+};
 
 // The whole conversation, stacked, with only what the reader has opened rendered.
 //
 // The thread endpoint already returns every message across folders, Sent replies included,
-// deduplicated by Message-ID preferring the INBOX copy, so this needs no scope parameter of
-// its own.
+// deduplicated by Message-ID preferring the INBOX copy, so showing it needs no scope parameter
+// of its own. It also holds another account's copy of the same email (#476), which stays on
+// screen. accountId, the account whose copies the actions take (ReadingPane says which), keeps
+// the actions and the card that opens to that account's copies; null keeps every copy.
 //
 // Design from #317 by YunQue0912.
-export default function ConversationPane({ threadId, folder, unified = false, selectedMessageId = null }) {
+export default function ConversationPane({ threadId, folder, unified = false, accountId = null, selectedMessageId = null, openedFromRow = false }) {
   const { t } = useTranslation();
+  const isMobile = useMobile();
+  const listFirst = useListFirst();
+  const withShortcut = useShortcutTitle();
   const addNotification = useStore(s => s.addNotification);
   const accounts = useStore(s => s.accounts);
+  const selectedRow = useStore(s => {
+    const pool = s.searchQuery?.trim() ? s.searchResults : s.messages;
+    return pool.find(message => message.id === selectedMessageId)
+      ?? Object.values(s.threadMessages).flat().find(message => message.id === selectedMessageId);
+  });
   const setSelectedMessage = useStore(s => s.setSelectedMessage);
+  const updateMessage = useStore(s => s.updateMessage);
+  const plaintextEmail = useStore(s => s.plaintextEmail);
   const [messages, setMessages] = useState([]);
   const [expanded, setExpanded] = useState(() => new Set());
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
-  // { x, y, view } — the move and snooze pickers are ContextMenu's, opened straight
-  // into the relevant sub-view rather than reimplemented here.
+  // { x, y, view, message } — the move and snooze pickers are ContextMenu's, opened straight
+  // into the relevant sub-view rather than reimplemented here. message is the copy they open on.
   const [picker, setPicker] = useState(null);
+  const [openedOnNewest, setOpenedOnNewest] = useState(null);
+  // The conversation the cards on screen belong to, set when its fetch lands (the stack's key).
+  const [loadedConversation, setLoadedConversation] = useState(null);
+  const [aiStatus, setAiStatus] = useState(null);
+
+  useEffect(() => {
+    api.ai.status().then(setAiStatus).catch(() => {});
+  }, []);
+  const aiEnabled = Boolean(aiStatus?.enabled && aiStatus?.features?.summarize);
+  const aiReplyEnabled = aiReplyAvailable(aiStatus, plaintextEmail);
+
+  // Read when the conversation arrives, without making the pick a reason to fetch it again.
+  const pickedRef = useRef(selectedMessageId);
+  pickedRef.current = selectedMessageId;
 
   useEffect(() => {
     if (!threadId) { setMessages([]); return; }
@@ -59,28 +101,92 @@ export default function ConversationPane({ threadId, folder, unified = false, se
         if (cancelled) return;
         const ordered = normalizeConversation(data?.messages || []);
         setMessages(ordered);
+        setLoadedConversation(`${accountId || ''}\n${threadId}`);
+        setOpenedOnNewest(newestConversationMessage(inAccount(ordered, accountId))?.id ?? null);
+        // A picker opened on the previous conversation's cards while this one loaded (below).
+        setPicker(null);
         // Opens on the newest message, the way every threaded client does: the reader
         // almost always wants the latest reply, and expanding everything would render a
-        // document per message.
-        setExpanded(initialExpandedMessageIds(ordered));
+        // document per message. The newest of accountId's copies, since opening a card marks it
+        // read. When the reader picked the other account's copy under the row, that copy opens on
+        // its own (the effect below): opening the row's copy beside it would mark that read too,
+        // behind a list row whose unread count does not follow.
+        const picked = ordered.find(message => message.id === pickedRef.current);
+        setExpanded(accountId && picked && picked.account_id !== accountId
+          ? new Set()
+          : initialExpandedMessageIds(inAccount(ordered, accountId)));
       })
       .catch(err => { if (!cancelled) setError(err.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [threadId, folder, unified]);
+  }, [threadId, folder, unified, accountId]);
+
+  // A reply that lands while the conversation is open shows up in its list row (the count and
+  // date change) but the pane fetched once, so it stayed out until the conversation was opened
+  // again. When the row changes the conversation is read again in place: the cards keep how they
+  // were opened, and the new message comes in collapsed, since opening a card marks it read.
+  const listedVersion = useStore(s => {
+    if (!threadId) return null;
+    const row = (s.searchQuery?.trim() ? s.searchResults : s.messages)
+      .find(m => (m.thread_id || m.id) === threadId && (!accountId || m.account_id === accountId));
+    return row ? `${row.message_count ?? 1}|${row.date}` : null;
+  });
+  const listedVersionRef = useRef({ threadId, version: listedVersion });
+  useEffect(() => {
+    const seen = listedVersionRef.current;
+    listedVersionRef.current = { threadId, version: listedVersion };
+    if (!threadId || seen.threadId !== threadId || !listedVersion || !seen.version || seen.version === listedVersion) return;
+    let cancelled = false;
+    api.getThread(threadId, folder, unified)
+      .then(data => {
+        if (cancelled) return;
+        setMessages(prev => {
+          if (!prev.length) return prev;
+          return normalizeConversation(applyReadGuard(applyDeleteGuard(data?.messages || []), prev));
+        });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [threadId, folder, unified, accountId, listedVersion]);
+
+  // The pane stays mounted from one conversation to the next, so an open picker would
+  // otherwise apply its pick to a conversation it was not opened on. The previous
+  // conversation's cards and buttons stay on screen until the next one lands, so a picker can
+  // still be opened on them after this runs; the fetch above closes that one when it lands.
+  useEffect(() => { setPicker(null); }, [threadId, accountId]);
 
   // Opening a message from the list opens it here too. Picking a different message in the
   // same thread leaves threadId untouched, so the pane used to re-render with identical
   // props and nothing happened on screen, which read as the click being ignored.
   const stackRef = useRef(null);
+  // A list row stands for the whole conversation, which opens on its newest message. The row's
+  // own message is only the newest in the listed folder, so opening it too put the other
+  // person's last message beside a newer reply of the reader's in Sent, and scrolled to it (#707).
+  // The newest card is then the selected one too, so the outline and the shortcuts follow it.
+  const selectedHere = Boolean(selectedMessageId) && messages.some(message => message.id === selectedMessageId);
+  // The newest card when the conversation loaded, so a reply read in afterwards (above) does not
+  // become the focused card, which would open it and mark it read without the reader opening it.
+  const focusedId = selectedHere && openedFromRow
+    ? (openedOnNewest && messages.some(message => message.id === openedOnNewest) ? openedOnNewest : null)
+      ?? newestConversationMessage(inAccount(messages, accountId))?.id ?? selectedMessageId
+    : selectedMessageId;
   useEffect(() => {
-    if (!selectedMessageId || !messages.some(message => message.id === selectedMessageId)) return;
-    setExpanded(prev => (prev.has(selectedMessageId) ? prev : new Set(prev).add(selectedMessageId)));
+    if (!selectedHere || !focusedId) return;
+    setExpanded(prev => (prev.has(focusedId) ? prev : new Set(prev).add(focusedId)));
     // Long threads run past the fold, so the message that was asked for is brought into
     // view rather than being opened somewhere off screen.
-    const card = stackRef.current?.querySelector(`[data-message-id="${selectedMessageId}"]`);
+    const card = stackRef.current?.querySelector(`[data-message-id="${focusedId}"]`);
     card?.scrollIntoView?.({ block: 'nearest' });
-  }, [selectedMessageId, messages]);
+  }, [selectedHere, focusedId, messages]);
+
+  // Swiping on a phone (#229), as in the single-message pane: from the left edge back to the list,
+  // and left and right for the next and previous row of the list, which may be a conversation or a
+  // single message (the SwipePager around the stack below).
+  const paneRef = useRef(null);
+  useSwipeBack({ enabled: isMobile, rootRef: paneRef, navKey: threadId, onBack: closeOpenMessage });
+  // Read so a new row in the list (or a search) refreshes the peeks either side.
+  useStore(s => s.messages);
+  useStore(s => s.searchResults);
 
   const toggle = (id) => setExpanded(prev => {
     const next = new Set(prev);
@@ -88,110 +194,245 @@ export default function ConversationPane({ threadId, folder, unified = false, se
     return next;
   });
 
-  // Acting on the conversation empties the reading pane: every message it was showing
-  // has just been removed from the list behind it.
-  const runAction = (action) => {
-    action(messages, {
+  // An action can find nothing to take: no copy of accountId at all (a link to a message of an
+  // account the thread route leaves out, a disabled one), no INBOX copy to snooze, only mail the
+  // reader sent to report as spam, or, for Archive and Move, the other account's draft picked under
+  // the row. Moving on as if it had worked would hide that, and so would staying put without a word:
+  // the conversation stays open and a notice says so.
+  const sayNothingTaken = (name) => addNotification({
+    title: t((otherAccountsDraft(messages, selectedMessageId, accountId) && NOTHING_TO_TAKE_DRAFT[name])
+      || (!accountId && NOTHING_TO_TAKE_UNIFIED[name]) || NOTHING_TO_TAKE[name]),
+  });
+
+  const runAction = (name, action) => {
+    const taken = action(messages, {
       t,
       addNotification,
       accounts,
       // The authoritative list, re-read when the action actually commits, so a reply
       // that arrived while this conversation was open is not left behind.
       fetchThread: () => api.getThread(threadId, folder, unified),
+      // Archive, delete and move keep drafts and the rest apart, by the selected message (keepDraftsApart).
+      anchorId: selectedMessageId,
+      // Archive moves only the copies in the folder being viewed, as the list's archive does: the
+      // unified inbox is every account's INBOX, an account view is that account's folder.
+      folder: unified ? 'INBOX' : folder,
+      // Whose copies every action takes, Archive's included, as ReadingPane decides: in one
+      // account's view the row's account even when the reader picked the other account's copy
+      // under the row, and null in the unified inbox.
+      accountId,
+      // Open what takes the place of the conversation's row (the afterRemove setting) while the row
+      // is still there to look up; with no row on screen, fall back to clearing the pane. The runner
+      // calls this only once it has something to take. The row has to be accountId's: a message
+      // opened from a notification can be another account's copy of a conversation this view lists,
+      // and acting for that account leaves that row where it is. Deleting a draft picked under the
+      // row, the other account's included, still moves on from the row, which stays listed: the pane
+      // has always moved on after deleting a draft.
+      beforeRemove: () => {
+        const { messages: listed, searchResults, searchQuery } = useStore.getState();
+        const row = (searchQuery.trim() ? searchResults : listed)
+          .find(m => (m.thread_id || m.id) === threadId && (!accountId || m.account_id === accountId));
+        if (row) advanceSelectionAfterRemoval(row.id, true);
+        else setSelectedMessage(null);
+      },
     });
-    setSelectedMessage(null);
+    if (!taken) sayNothingTaken(name);
   };
 
+  // A flag change on one card: the pane's copy of the thread and the list's copy both change.
+  const updateConversationMessage = (id, patch) => {
+    setMessages(prev => prev.map(message => (message.id === id ? { ...message, ...patch } : message)));
+    updateMessage(id, patch);
+  };
+
+  // The window opens on the click, before any await, or the browser blocks it. Bodies are loaded
+  // one at a time: collapsed messages have none yet, and a session-limited provider serves the
+  // account over a single connection.
+  const printConversation = async () => {
+    const win = openPrintWindow(t('message.preparingPrint'));
+    if (!win) return;
+    const entries = [];
+    for (const message of messages) {
+      const body = await api.getMessageBody(message.id).catch(() => null);
+      if (win.closed) return;
+      entries.push({ message, body });
+    }
+    printInWindow(win, buildPrintDocument(entries));
+  };
+
+  // Both pickers open on the newest of accountId's copies (of any account's in the unified inbox):
+  // the move picker lists that copy's account's folders, and the snooze picker's Back row leads
+  // to the full menu, whose plugin items (GTD classify) act on that copy. With no copy of
+  // accountId on screen there is nothing to open either on. With the other account's draft picked
+  // under the row Move takes nothing (moveThread), and the reader is told before picking a folder.
   const openPicker = (event, view) => {
+    const pickerMessage = newestConversationMessage(inAccount(messages, accountId));
+    if (!pickerMessage || (view === 'move' && otherAccountsDraft(messages, selectedMessageId, accountId))) {
+      sayNothingTaken(view);
+      return;
+    }
     const rect = event.currentTarget.getBoundingClientRect();
-    setPicker({ x: rect.left, y: rect.bottom + 4, view });
+    setPicker({ x: rect.left, y: rect.bottom + 4, view, message: pickerMessage });
   };
 
   // Every branch that returns from here fills the reading area, for the same flex reason
   // as the stack below: a bare div would collapse to the width of its own text.
   const fill = { flex: 1, minWidth: 0, height: '100%', background: 'var(--bg-primary)' };
 
-  if (error) return <div style={{ ...fill, padding: 16, color: 'var(--red, #e03131)' }}>{error}</div>;
+  // On a phone this pane replaces the message pane, and with it the only header the
+  // reading area had. Without a bar of its own, the thread actions sat under the iOS
+  // status bar — a standalone PWA draws its content behind it — and the conversation
+  // could not be left at all, since a standalone PWA has no swipe-back either. Same bar
+  // the message pane shows, safe-area padding included.
+  // The GTD states of the open message: in the back bar when there is one, else in the toolbar.
+  const headerMessage = selectedRow || messages.find(message => message.id === selectedMessageId)
+    || newestConversationMessage(inAccount(messages, accountId));
+  const headerContext = { message: headerMessage, account: accounts.find(account => account.id === headerMessage?.account_id) };
+  const hasBackBar = isMobile || listFirst;
+  const mobileBackBar = hasBackBar && (
+    <div style={{
+      display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
+      paddingTop: 'calc(var(--sat) + 10px)', paddingBottom: 'calc(10px - var(--sat-trim))', paddingLeft: 14, paddingRight: 14,
+      borderBottom: '1px solid var(--border-subtle)', background: 'var(--bg-secondary)', flexShrink: 0,
+    }}>
+      <button
+        onClick={closeOpenMessage}
+        style={{
+          background: 'none', border: 'none', color: 'var(--accent)',
+          cursor: 'pointer', display: 'flex', alignItems: 'center',
+          gap: 2, padding: '4px 0', fontSize: 15, fontWeight: 500,
+        }}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+          <polyline points="15 18 9 12 15 6"/>
+        </svg>
+        {t('common.back')}
+      </button>
+      <div style={{
+        flex: '1 1 120px', minWidth: 0,
+        fontSize: 14, fontWeight: 500, color: 'var(--text-primary)',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>
+        {newestConversationMessage(messages)?.subject || ''}
+      </div>
+      {headerMessage && <PluginSlot name="message-header-meta" ctx={headerContext} />}
+    </div>
+  );
+
+  if (error) return (
+    <div ref={paneRef} style={fill}>
+      {mobileBackBar}
+      <div style={{ padding: 16, color: 'var(--red, #e03131)' }}>{error}</div>
+    </div>
+  );
   if (loading && !messages.length) {
     return (
-      <div style={{ ...fill, padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div className="skeleton-line" style={{ height: 13, width: '48%', borderRadius: 4 }} />
-        <div className="skeleton-line" style={{ height: 13, width: '70%', borderRadius: 4 }} />
+      <div ref={paneRef} style={fill}>
+        {mobileBackBar}
+        <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div className="skeleton-line" style={{ height: 13, width: '48%', borderRadius: 4 }} />
+          <div className="skeleton-line" style={{ height: 13, width: '70%', borderRadius: 4 }} />
+        </div>
       </div>
     );
   }
   if (!messages.length) return null;
 
   return (
-    <div
-      // Remounts the stack when the thread's membership changes, so expansion state from a
-      // previous conversation can never be applied to this one's message ids.
-      key={conversationMembershipKey(messages)}
-      ref={stackRef}
-      // flex: 1 and minWidth: 0 are load-bearing. The reading area is a flex row, so
-      // without them this pane is sized shrink-to-fit by its contents: collapsed cards
-      // are narrow, an expanded newsletter is as wide as the newsletter, and the pane
-      // jumped around as the reader opened and closed messages. minWidth: 0 is the other
-      // half, since a flex item defaults to min-width:auto and a wide email would
-      // otherwise push the pane past its share of the row.
-      style={{
-        flex: 1, minWidth: 0,
-        padding: 12, overflowY: 'auto', height: '100%',
+    <div ref={paneRef} style={{ ...fill, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      {mobileBackBar}
+      {/* Thread-level actions, the way Gmail does it: archiving a conversation archives all of it,
+          so the reader does not file the same thread message by message. The reading pane's buttons,
+          in its order and pinned at the top as its toolbar is (#650); snooze, which the reading pane
+          keeps in its menu, sits with the other ways of putting the conversation away. */}
+      <div role="group" aria-label={t('message.conversationActions')} style={{
+        padding: isMobile ? '0 8px' : '8px 16px', borderBottom: '1px solid var(--border-subtle)',
+        display: 'flex', alignItems: 'center', gap: isMobile ? 0 : 6, flexShrink: 0,
         background: 'var(--bg-primary)',
-      }}
-    >
-      {/* Thread-level actions, the way Gmail does it: archiving a conversation archives
-          all of it, so the reader does not file the same thread message by message. */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-        <ThreadBtn onClick={() => runAction(archiveThread)} title={t('message.archive')}>
-          {t('message.archive')}
-        </ThreadBtn>
-        <ThreadBtn onClick={() => runAction(deleteThread)} title={t('message.delete')}>
-          {t('message.delete')}
-        </ThreadBtn>
-        <ThreadBtn onClick={() => runAction(spamThread)} title={t('contextMenu.markAsSpam')}>
-          {t('contextMenu.markAsSpam')}
-        </ThreadBtn>
-        <ThreadBtn
-          onClick={e => openPicker(e, 'move')}
-          title={t('contextMenu.moveToFolder')}
-        >
-          {t('contextMenu.moveToFolder')}
-        </ThreadBtn>
-        <ThreadBtn
-          onClick={e => openPicker(e, 'snooze')}
-          title={t('contextMenu.snooze.label')}
-        >
-          {t('contextMenu.snooze.label')}
-        </ThreadBtn>
+      }}>
+        <ActionBtn onClick={() => runAction('archive', archiveThread)} label={t('message.archive')} title={withShortcut(t('message.archive'), 'archive')} touch={isMobile}>
+          <ArchiveIcon />
+        </ActionBtn>
+        <ActionBtn onClick={e => openPicker(e, 'move')} label={t('contextMenu.moveToFolder')} touch={isMobile} popup expanded={picker?.view === 'move'}>
+          <MoveIcon />
+        </ActionBtn>
+        <ActionBtn onClick={e => openPicker(e, 'snooze')} label={t('contextMenu.snooze.label')} touch={isMobile} popup expanded={picker?.view === 'snooze'}>
+          <SnoozeIcon />
+        </ActionBtn>
+        {!hasBackBar && headerMessage && <PluginSlot name="message-header-meta" ctx={headerContext} />}
+        <div style={{ flex: 1 }} />
+        <ActionBtn onClick={() => runAction('spam', spamThread)} label={t('contextMenu.markAsSpam')} touch={isMobile}>
+          <SpamIcon />
+        </ActionBtn>
+        <ActionBtn onClick={printConversation} label={t('message.printConversation')} touch={isMobile}>
+          <PrintIcon />
+        </ActionBtn>
+        <ActionBtn onClick={() => runAction('delete', deleteThread)} label={t('message.delete')} danger touch={isMobile}>
+          <TrashIcon />
+        </ActionBtn>
       </div>
 
       {picker && (
         <ContextMenu
           x={picker.x}
           y={picker.y}
-          message={newestConversationMessage(messages)}
+          message={picker.message}
           variant="conversation"
           defaultMoveView={picker.view === 'move'}
           defaultSnoozeView={picker.view === 'snooze'}
           onClose={() => setPicker(null)}
           onAction={(action, data) => {
-            if (action === 'moveTo') runAction((list, opts) => moveThread(list, data, opts));
-            else if (action === 'snooze') runAction((list, opts) => snoozeThread(list, data, opts));
+            if (action === 'moveTo') runAction('move', (list, opts) => moveThread(list, data, opts));
+            else if (action === 'snooze') runAction('snooze', (list, opts) => snoozeThread(list, data, opts));
             setPicker(null);
           }}
         />
       )}
 
-      {messages.map(message => (
-        <ConversationMessageCard
-          key={message.id}
-          message={message}
-          expanded={expanded.has(message.id)}
-          selected={message.id === selectedMessageId}
-          onToggle={toggle}
-        />
-      ))}
+      <SwipePager
+        enabled={isMobile}
+        prev={isMobile ? adjacentRow('prev', threadId) : null}
+        next={isMobile ? adjacentRow('next', threadId) : null}
+        navKey={threadId}
+        onNavigate={(dir) => openAdjacentRow(dir, threadId)}
+        // Warms the server's copy of a neighbor's body ahead of the swipe.
+        onPrefetch={(row) => prefetchBody(row.id)}
+      >
+      <div
+        // Remounts the stack when another conversation lands, so nothing a card holds carries over
+        // to the next one. Not on a reply read in while it is open (above): a remount ran every open
+        // card's mark-read again, so a message the reader had just marked unread was read again,
+        // and the scroll position and an open dialog were lost. The cards are keyed by message id,
+        // so a new one simply joins the stack. Not on threadId either: the previous conversation's
+        // cards stay on screen until the next one lands, and a remount would mark them read again.
+        key={loadedConversation ?? ''}
+        ref={stackRef}
+        // flex: 1 and minWidth: 0 are load-bearing. The reading area is a flex row, so
+        // without them this pane is sized shrink-to-fit by its contents: collapsed cards
+        // are narrow, an expanded newsletter is as wide as the newsletter, and the pane
+        // jumped around as the reader opened and closed messages. minWidth: 0 is the other
+        // half, since a flex item defaults to min-width:auto and a wide email would
+        // otherwise push the pane past its share of the row.
+        style={{
+          flex: 1, minWidth: 0,
+          padding: 12, overflowY: 'auto',
+          background: 'var(--bg-primary)',
+        }}
+      >
+        {messages.map(message => (
+          <ConversationMessageCard
+            key={message.id}
+            message={message}
+            expanded={expanded.has(message.id)}
+            selected={message.id === focusedId}
+            onToggle={toggle}
+            onUpdate={updateConversationMessage}
+            aiEnabled={aiEnabled}
+            aiReplyEnabled={aiReplyEnabled}
+          />
+        ))}
+      </div>
+      </SwipePager>
     </div>
   );
 }

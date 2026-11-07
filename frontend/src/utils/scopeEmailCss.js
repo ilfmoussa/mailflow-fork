@@ -1,5 +1,5 @@
 import postcss from 'postcss';
-import DOMPurify from 'dompurify';
+import { sanitizeEmailForApp } from './appEmailHtml.js';
 
 // At-rules stripped entirely before scoping. @import/@charset are semantically
 // wrong inside an inlined style block. @font-face and @keyframes are injected
@@ -90,7 +90,7 @@ export function prepareEmailHtml(rawHtml, uid) {
     }
     .${prefix} img { max-width: 100% !important; height: auto !important; }
     .${prefix} > table, .${prefix} > center > table,
-    .${prefix} > div > table, .${prefix} > center > div > table { width: 100% !important; }
+    .${prefix} > div > table, .${prefix} > center > div > table { max-width: 100%; }
     .${prefix} td, .${prefix} th { min-width: 0 !important; }
     .${prefix} th { overflow-wrap: normal; word-break: normal; }
     .${prefix} td { word-break: break-word; }
@@ -106,7 +106,7 @@ export function prepareEmailHtml(rawHtml, uid) {
   // no iframe/CSP isolation, so sanitize on the client too. The server sanitizer is
   // the primary gate; this second pass neutralizes any sanitizer bypass / mutation
   // XSS or a legacy row stored before server sanitization existed.
-  const safe = DOMPurify.sanitize(withRel, { ADD_ATTR: ['target'], FORBID_TAGS: ['style'] });
+  const safe = sanitizeEmailForApp(withRel, { ADD_ATTR: ['target'], FORBID_TAGS: ['style'] });
 
   return { prefix, styleBlocks, html: safe };
 }

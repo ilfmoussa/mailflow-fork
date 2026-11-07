@@ -142,3 +142,118 @@ describe('PATCH /auth/preferences defaultSender (#417)', () => {
     }
   });
 });
+
+describe('PATCH /auth/preferences hoverActionSet (#440)', () => {
+  const call = async (body) => {
+    const req = { session: { userId: 'user-1' }, body };
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences(req, res);
+    return { req, res };
+  };
+
+  it('merges a sanitized set into preferences as JSONB, canonical order, unknown keys dropped', async () => {
+    // The frontend saves through schedulePrefSave like every other preference; before this
+    // clause existed the key was silently dropped server-side and the setting never synced
+    // across devices — localStorage made it LOOK persisted on the device that set it.
+    const { res } = await call({ hoverActionSet: ['snooze', 'bogus', 'archive'] });
+    const [sql, params] = query.mock.calls[0];
+    expect(sql).toContain("jsonb_build_object('hoverActionSet', $44::jsonb)");
+    expect(params[43]).toBe(JSON.stringify(['archive', 'snooze'])); // canonical order, 'bogus' gone
+    expect(res.json).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('leaves the stored value untouched when the key is absent or malformed', async () => {
+    await call({ theme: 'dark' });
+    expect(query.mock.calls[0][1][43]).toBeNull();
+    query.mockClear();
+    await call({ hoverActionSet: 'markRead' }); // not an array — ignored, not stored
+    expect(query.mock.calls[0][1][43]).toBeNull();
+  });
+});
+
+
+describe('PATCH /auth/preferences autoOpenReplyDrafts', () => {
+  for (const value of [true, false]) it(`persists explicit ${value}`, async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { autoOpenReplyDrafts: value } }, res);
+    expect(query.mock.calls[0][0]).toContain("jsonb_build_object('autoOpenReplyDrafts', $45::boolean)");
+    expect(query.mock.calls[0][1][44]).toBe(value);
+  });
+  it('rejects a nonboolean without a write', async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { autoOpenReplyDrafts: 'true' } }, res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /auth/preferences afterRemove (#572)', () => {
+  it.each(['next', 'previous', 'list'])('stores %s', async (value) => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { afterRemove: value } }, res);
+    expect(query.mock.calls[0][0]).toContain("jsonb_build_object('afterRemove', $46::text)");
+    expect(query.mock.calls[0][1][45]).toBe(value);
+  });
+
+  it.each(['open', '', 3, null])('ignores %p', async (value) => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { afterRemove: value } }, res);
+    expect(query.mock.calls[0][1][45]).toBeNull();
+  });
+});
+
+describe('PATCH /auth/preferences darkEmailBodies (#228)', () => {
+  for (const value of [true, false]) it(`persists explicit ${value}`, async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { darkEmailBodies: value } }, res);
+    expect(query.mock.calls[0][0]).toContain("jsonb_build_object('darkEmailBodies', $47::boolean)");
+    expect(query.mock.calls[0][1][46]).toBe(value);
+  });
+  it('rejects a nonboolean without a write', async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { darkEmailBodies: 'yes' } }, res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /auth/preferences listSort', () => {
+  const res = () => ({ status: vi.fn().mockReturnThis(), json: vi.fn() });
+  const account = '22222222-2222-4222-8222-222222222222';
+
+  it('stores each folder\'s order and leaves out folders at the default', async () => {
+    const listSort = {
+      [`${account}:Archive`]: { sort: 'from', dir: 'asc', starredFirst: false },
+      'all:INBOX': { sort: 'date', dir: 'desc', starredFirst: true },
+      [`${account}:INBOX`]: { sort: 'date', dir: 'desc', starredFirst: false },
+    };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { listSort } }, res());
+
+    const [sql, params] = query.mock.calls[0];
+    expect(sql).toContain("jsonb_build_object('listSort', $48::jsonb)");
+    expect(JSON.parse(params[47])).toEqual({
+      [`${account}:Archive`]: { sort: 'from', dir: 'asc', starredFirst: false },
+      'all:INBOX': { sort: 'date', dir: 'desc', starredFirst: true },
+    });
+  });
+
+  it('leaves listSort alone when it is not sent', async () => {
+    await patchPreferences({ session: { userId: 'user-1' }, body: { pageSize: '50' } }, res());
+    expect(query.mock.calls[0][1][47]).toBeNull();
+  });
+
+  for (const [name, listSort] of [
+    ['an array', []],
+    ['an unknown order', { 'all:INBOX': { sort: 'size' } }],
+    ['an unknown direction', { 'all:INBOX': { sort: 'from', dir: 'up' } }],
+    ['a key without an account', { INBOX: { sort: 'from' } }],
+    ['a non-boolean starredFirst', { 'all:INBOX': { starredFirst: 'yes' } }],
+  ]) {
+    it(`refuses ${name}`, async () => {
+      const r = res();
+      await patchPreferences({ session: { userId: 'user-1' }, body: { listSort } }, r);
+      expect(r.status).toHaveBeenCalledWith(400);
+      expect(query).not.toHaveBeenCalled();
+    });
+  }
+});

@@ -51,10 +51,6 @@ export default function MessageHeaderModal({ messageId, subject, onClose, onSubj
     }
   }
 
-  const important = new Set(['from','to','cc','bcc','subject','date','message-id','reply-to',
-    'return-path','received','x-mailer','mime-version','content-type','dkim-signature',
-    'authentication-results','x-spam-status','x-spam-score']);
-
   const displaySubject = (resolvedSubject && resolvedSubject !== '(no subject)')
     ? resolvedSubject
     : (parsedHeaders.find(h => h.key.toLowerCase() === 'subject')?.value || t('common.noSubject'));
@@ -94,7 +90,10 @@ export default function MessageHeaderModal({ messageId, subject, onClose, onSubj
             {copied ? t('contextMenu.headers.copied') : t('contextMenu.headers.copyRaw')}
           </button>
           <button
+            type="button"
             onClick={onClose}
+            aria-label={t('window.close')}
+            title={t('window.close')}
             style={{
               flexShrink: 0, background: 'none', border: 'none', padding: 6,
               color: 'var(--text-tertiary)', cursor: 'pointer', borderRadius: 6,
@@ -102,7 +101,7 @@ export default function MessageHeaderModal({ messageId, subject, onClose, onSubj
               WebkitTapHighlightColor: 'transparent',
             }}
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
               <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
             </svg>
           </button>
@@ -114,16 +113,14 @@ export default function MessageHeaderModal({ messageId, subject, onClose, onSubj
             </div>
           )}
           {!loading && parsedHeaders.length > 0 && parsedHeaders.map((h, i) => {
-            const isImportant = important.has(h.key.toLowerCase());
             return (
               <div key={i} style={{
                 borderBottom: '1px solid var(--border-subtle)',
-                background: isImportant ? 'rgba(124,106,247,0.04)' : 'transparent',
                 padding: '8px 16px',
               }}>
                 <div style={{
-                  fontSize: 10, fontWeight: isImportant ? 600 : 400,
-                  color: isImportant ? 'var(--accent)' : 'var(--text-tertiary)',
+                  fontSize: 10, fontWeight: 600,
+                  color: 'var(--text-primary)',
                   fontFamily: 'JetBrains Mono, monospace',
                   textTransform: 'uppercase', letterSpacing: '0.04em',
                   marginBottom: 2,
@@ -201,14 +198,17 @@ export default function MessageHeaderModal({ messageId, subject, onClose, onSubj
               {copied ? t('contextMenu.headers.copied') : t('contextMenu.headers.copyRaw')}
             </button>
             <button
+              type="button"
               onClick={onClose}
+              aria-label={t('window.close')}
+              title={t('window.close')}
               style={{
                 background: 'none', border: 'none', padding: 6,
                 color: 'var(--text-tertiary)', cursor: 'pointer', borderRadius: 6,
                 display: 'flex', alignItems: 'center',
               }}
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                 <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
               </svg>
             </button>
@@ -224,16 +224,14 @@ export default function MessageHeaderModal({ messageId, subject, onClose, onSubj
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
               <tbody>
                 {parsedHeaders.map((h, i) => {
-                  const isImportant = important.has(h.key.toLowerCase());
                   return (
                     <tr key={i} style={{
                       borderBottom: '1px solid var(--border-subtle)',
-                      background: isImportant ? 'rgba(124,106,247,0.04)' : 'transparent',
                     }}>
                       <td style={{
                         padding: '6px 12px 6px 0', verticalAlign: 'top',
-                        color: isImportant ? 'var(--accent)' : 'var(--text-tertiary)',
-                        fontWeight: isImportant ? 600 : 400,
+                        color: 'var(--text-primary)',
+                        fontWeight: 600,
                         whiteSpace: 'nowrap', width: 200, fontFamily: 'JetBrains Mono, monospace',
                         fontSize: 11,
                       }}>

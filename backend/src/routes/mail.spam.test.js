@@ -12,6 +12,7 @@ vi.mock('../index.js', () => ({
     _guardMoveUid: vi.fn(),
     _unguardMoveUid: vi.fn(),
     moveMessage: vi.fn(),
+    syncFolderOnDemand: vi.fn(),
     broadcast: vi.fn(),
   },
 }));
@@ -29,6 +30,7 @@ import { query } from '../services/db.js';
 import { imapManager } from '../index.js';
 import { tokenize, extractFlagFeatures } from '../services/spamTokenizer.js';
 import { updateIncrementalForUser } from '../services/spamModelStore.js';
+import { takeCarry } from '../services/movedRowCarry.js';
 
 const USER_ID = 'user-1';
 const ACCOUNT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -76,6 +78,7 @@ beforeEach(() => {
   imapManager._guardMoveUid.mockReset();
   imapManager._unguardMoveUid.mockReset();
   imapManager.moveMessage.mockReset();
+  imapManager.syncFolderOnDemand.mockReset();
   imapManager.broadcast.mockReset();
 
   tokenize.mockReturnValue(['cheap', 'viagra', 'buy', 'now']);
@@ -177,5 +180,31 @@ describe('POST /api/mail/messages/:id/ham — move path (message leaves spam)', 
 
     expect(updateIncrementalForUser).toHaveBeenCalledTimes(1);
     expect(updateIncrementalForUser).toHaveBeenCalledWith(USER_ID, expect.anything(), 'ham');
+  });
+
+  // The source uid can belong to another message in the inbox (#665), so the row is not kept on it.
+  it('without a new uid, drops the row and pulls the inbox instead of keeping the source uid', async () => {
+    query.mockResolvedValueOnce({ rows: [{ account_id: ACCOUNT_ID, folder: 'Junk', folder_mappings: { spam: 'Junk', inbox: 'INBOX' } }] });
+    query.mockResolvedValueOnce({ rows: [{}] });
+    query.mockResolvedValueOnce({ rows: [messageRow()] });
+    query.mockResolvedValueOnce({ rows: [{ id: ACCOUNT_ID }] });
+    const date = '2026-11-04T10:00:00.000Z';
+    query.mockImplementation(async (sql) => (sql === 'DELETE FROM messages WHERE id = $1 RETURNING *'
+      ? { rows: [messageRow({ date, spam_verdict: 'spam', spam_user_override: null, category: 'promotions' })] }
+      : { rows: [] }));
+    imapManager.moveMessage.mockResolvedValue(null);
+    imapManager.syncFolderOnDemand.mockResolvedValue(undefined);
+
+    const res = await fetch(`${base}/api/mail/messages/${MESSAGE_ID}/ham`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const sqls = query.mock.calls.map(([sql, params]) => [sql.replace(/\s+/g, ' ').trim(), params]);
+    expect(sqls.filter(([sql]) => sql.startsWith('UPDATE messages'))).toEqual([]);
+    expect(sqls).toContainEqual(['DELETE FROM messages WHERE id = $1 RETURNING *', [MESSAGE_ID]]);
+    expect(imapManager.syncFolderOnDemand).toHaveBeenCalledWith({ id: ACCOUNT_ID }, 'INBOX');
+    expect(getSpamInserts()).toHaveLength(1);
+    // The inbox's sync files it again with the user's verdict, not as mail to classify.
+    expect(takeCarry(ACCOUNT_ID, 'INBOX', '<abc123@example.com>', date)).toMatchObject({
+      spam_user_override: 'ham', spam_verdict: 'ham', category: 'promotions',
+    });
   });
 });
